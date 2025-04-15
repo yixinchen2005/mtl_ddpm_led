@@ -2,7 +2,7 @@ import os
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
-from transformers import BertTokenizer, CLIPProcessor, AutoTokenizer
+from transformers import BertTokenizer, CLIPProcessor, AutoTokenizer, BertModel
 from utils.utils import remove_excluded_words, strong_augment_pil_image
 import logging
 logger = logging.getLogger(__name__)
@@ -14,6 +14,7 @@ class LEDProcessor(object):
         self.data_path = data_path
         self.args = args
         self.tokenizer = BertTokenizer.from_pretrained(os.path.join(self.args.local_cache_path, self.args.lm_name), do_lower_case=True)
+        self.bert = BertModel.from_pretrained(os.path.join(self.args.local_cache_path, self.args.lm_name))
         self.char2int, self.int2char = torch.load(os.path.join(clstm_path, "char_vocab.pkl"))
         clip_processor = CLIPProcessor.from_pretrained(os.path.join(self.args.local_cache_path, self.args.vit_name))
         aux_processor = CLIPProcessor.from_pretrained(os.path.join(self.args.local_cache_path, self.args.vit_name))
@@ -23,6 +24,7 @@ class LEDProcessor(object):
         self.clip_processor = clip_processor
         self.aux_processor = aux_processor
         self.rcnn_processor = rcnn_processor
+        self.LABELS = ["[PAD]", "O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "X", "[CLS]", "[SEP]"]
 
     def load_from_file(self, mode="supervsed"):
         """
@@ -66,11 +68,43 @@ class LEDProcessor(object):
         return {"words": words, "targets_old": targets_old, "targets_new": targets_new, "img_names": img_names, "aux_img_dict": aux_img_dict, "rcnn_img_dict": rcnn_img_dict}
 
     def get_label_mapping(self):
-        LABELS = ["PAD", "O", "B-MISC", "I-MISC", "B-PER", "I-PER",
-                  "B-ORG", "I-ORG", "B-LOC", "I-LOC", "X", "[CLS]", "[SEP]"]
-        label_mapping = {label: idx for idx, label in enumerate(LABELS)}
+        label_mapping = {label: idx for idx, label in enumerate(self.LABELS)}
         return label_mapping
-
+    
+    def get_label_embedding(self):
+        # Mapping to BERT-friendly words
+        label2word_mapping = {
+            "[PAD]": "[PAD]",
+            "O": "other",
+            "B-MISC": "miscellaneous",
+            "I-MISC": "miscellaneous",
+            "B-PER": "person",
+            "I-PER": "person",
+            "B-ORG": "organization",
+            "I-ORG": "organization",
+            "B-LOC": "location",
+            "I-LOC": "location",
+            "X": "unknown",
+            "[CLS]": "[CLS]",  # Keep BERT special tokens
+            "[SEP]": "[SEP]"
+        }
+        embeddings = []
+        for label in self.LABELS:
+            word = label2word_mapping[label]
+            # Convert word to token ID(s)
+            token_ids = self.tokenizer.convert_tokens_to_ids([word])
+            if len(token_ids) != 1 or token_ids[0] == self.tokenizer.unk_token_id:
+                # Handle cases where word isn't in vocab (rare with our mapping)
+                print(f"Warning: {word} not in vocab, using 'unknown'")
+                token_ids = [self.tokenizer.convert_tokens_to_ids("unknown")]
+            # Get embedding from BERT's embedding table
+            token_id_tensor = torch.tensor([token_ids[0]], dtype=torch.long)
+            with torch.no_grad():
+                embedding = self.bert.get_input_embeddings()(token_id_tensor)  # Shape: (1, 768)
+                embeddings.append(embedding.squeeze(0))  # Shape: (768,)
+        # Stack into a table
+        embedding_table = torch.stack(embeddings)  # Shape: (num_labels, 768)
+        return embedding_table
 
 class LEDDataset(Dataset):
     def __init__(self, processor, transform, imgs_path=None, aux_imgs_path=None, max_seq_len=128, max_char_len=128, mode="supervised", ignore_idx=0, aux_size=128, rcnn_imgs_path="data/NER_data", rcnn_size=128):

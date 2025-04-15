@@ -54,7 +54,7 @@ class CoreModel(nn.Module):
         self.args = args
         self.prompt_dim = args.prompt_dim
         self.prompt_len = args.prompt_len
-        self.bert = BertModel.from_pretrained("/home/yixin/workspace/huggingface/" + args.lm_name)
+        self.bert = BertModel.from_pretrained(os.path.join(self.args.local_cache_path, self.args.lm_name))
 
         if args.use_prompt:
             self.image_model = ImageModel()  # bsz, 6, 56, 56

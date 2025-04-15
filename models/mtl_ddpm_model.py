@@ -4,7 +4,7 @@ from torch import nn
 from torchcrf import CRF
 from copy import deepcopy
 from .char_lstm import CharLSTM
-from .bert_model import CoreModel
+from .bert_model import HMNeTNERModel
 from .unimo_model import UnimoCRFModel
 from utils.attention import MultiAttn, PositionalEncoding
 
@@ -23,12 +23,13 @@ class NoiseScheduler:
         return signal_rate_t * x + noise_rate_t * noise, noise
 
 class DiffusionModel(nn.Module):
-    def __init__(self, args, num_labels, clstm_path, vt_model_name="hvpnet", vt_model_dir="new"):
+    def __init__(self, args, num_labels, label_embedding_table, clstm_path, ner_model_name="hvpnet"):
         super().__init__()
         # Configurations #
         self.args = args
         self.num_labels = num_labels
-        self.vt_model_name = vt_model_name
+        self.label_embedding_table = label_embedding_table
+        self.ner_model_name = ner_model_name
         # Time #
         self.time_mlp = nn.Linear(1, self.args.time_hidden_dim)
         # Char LSTM #
@@ -40,45 +41,47 @@ class DiffusionModel(nn.Module):
         self.char_pos_encoder = PositionalEncoding(4*self.args.char_hidden_dim, self.args.max_seq_len)
         self.label_pos_encoder = PositionalEncoding(self.args.label_hidden_dim, self.args.max_seq_len)
         # Visual-Textual Clue Encoder #
-        if self.vt_model_name == "hvpnet":
-            self.core = CoreModel(self.args)
-            # self.core.load_state_dict(torch.load(os.path.join("./", "hvp_core_model_"+vt_model_dir+".pth")))
-            self.core.load_state_dict(torch.load(os.path.join("./", "hvp_core_model.pth")))
-        elif self.vt_model_name == "mkgformer":
-            self.core = UnimoCRFModel(self.num_labels, args).model
-            # self.core.load_state_dict(torch.load(os.path.join("./", "mkg_core_model_"+vt_model_dir+".pth")))
-            self.core.load_state_dict(torch.load(os.path.join("./", "mkg_core_model.pth")))
+        if self.ner_model_name == "hvpnet":
+            self.ner_model = HMNeTNERModel(self.num_labels, args)
+            self.vt_encoder = self.ner_model.core
+        elif self.ner_model_name == "mkgformer":
+            self.ner_model = UnimoCRFModel(self.num_labels, args)
+            self.vt_encoder = self.ner_model.model
         else:
-            self.core = None
+            self.ner_model = None
+            self.vt_encoder = None
         # Label Encoder #
-        self.label_mlp = nn.Linear(num_labels, self.args.label_hidden_dim)
-        self.label_layer_norm = nn.LayerNorm(self.args.label_hidden_dim)
+        self.label_mlp = nn.Sequential(
+            nn.Linear(768, self.args.label_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.args.label_hidden_dim, self.args.label_hidden_dim)
+        )
         # Self Attentions #
         self.char_self_attn = MultiAttn(query_dim=self.args.char_hidden_dim, key_dim=self.args.char_hidden_dim, value_dim=self.args.char_hidden_dim, emb_dim=self.args.char_hidden_dim, num_heads=4, dropout_rate=0.1)
         self.label_self_attn = MultiAttn(query_dim=self.args.label_hidden_dim, key_dim=self.args.label_hidden_dim, value_dim=self.args.label_hidden_dim, emb_dim=self.args.label_hidden_dim, num_heads=1, dropout_rate=0.1)
         # Cross Attention #
-        if self.vt_model_name == "hvpnet":
-            self.label_vt_attn = MultiAttn(query_dim=self.args.label_hidden_dim, key_dim=self.core.bert.config.hidden_size, value_dim=self.core.bert.config.hidden_size, emb_dim=self.core.bert.config.hidden_size, num_heads=4, dropout_rate=0.1)
-            self.char_vt_attn = MultiAttn(query_dim=self.args.char_hidden_dim, key_dim=self.core.bert.config.hidden_size, value_dim=self.core.bert.config.hidden_size, emb_dim=self.core.bert.config.hidden_size, num_heads=4, dropout_rate=0.1)
-            self.vt_label_attn = MultiAttn(query_dim=self.core.bert.config.hidden_size, key_dim=self.args.label_hidden_dim, value_dim=self.args.label_hidden_dim, emb_dim=self.args.label_hidden_dim, num_heads=4, dropout_rate=0.1)
-        elif self.vt_model_name == "mkgformer":
-            self.label_vt_attn = MultiAttn(query_dim=self.args.label_hidden_dim, key_dim=self.core.text_config.hidden_size, value_dim=self.core.text_config.hidden_size, emb_dim=self.core.text_config.hidden_size, num_heads=4, dropout_rate=0.1)
-            self.char_vt_attn = MultiAttn(query_dim=self.args.char_hidden_dim, key_dim=self.core.text_config.hidden_size, value_dim=self.core.text_config.hidden_size, emb_dim=self.core.text_config.hidden_size, num_heads=4, dropout_rate=0.1)
-            self.vt_label_attn = MultiAttn(query_dim=self.core.text_config.hidden_size, key_dim=self.args.label_hidden_dim, value_dim=self.args.label_hidden_dim, emb_dim=self.args.label_hidden_dim, num_heads=4, dropout_rate=0.1)
+        if self.ner_model_name == "hvpnet":
+            self.label_vt_attn = MultiAttn(query_dim=self.args.label_hidden_dim, key_dim=self.vt_encoder.bert.config.hidden_size, value_dim=self.vt_encoder.bert.config.hidden_size, emb_dim=self.vt_encoder.bert.config.hidden_size, num_heads=4, dropout_rate=0.1)
+            self.char_vt_attn = MultiAttn(query_dim=self.args.char_hidden_dim, key_dim=self.vt_encoder.bert.config.hidden_size, value_dim=self.vt_encoder.bert.config.hidden_size, emb_dim=self.vt_encoder.bert.config.hidden_size, num_heads=4, dropout_rate=0.1)
+            self.vt_label_attn = MultiAttn(query_dim=self.vt_encoder.bert.config.hidden_size, key_dim=self.args.label_hidden_dim, value_dim=self.args.label_hidden_dim, emb_dim=self.args.label_hidden_dim, num_heads=4, dropout_rate=0.1)
+        elif self.ner_model_name == "mkgformer":
+            self.label_vt_attn = MultiAttn(query_dim=self.args.label_hidden_dim, key_dim=self.vt_encoder.text_config.hidden_size, value_dim=self.vt_encoder.text_config.hidden_size, emb_dim=self.vt_encoder.text_config.hidden_size, num_heads=4, dropout_rate=0.1)
+            self.char_vt_attn = MultiAttn(query_dim=self.args.char_hidden_dim, key_dim=self.vt_encoder.text_config.hidden_size, value_dim=self.vt_encoder.text_config.hidden_size, emb_dim=self.vt_encoder.text_config.hidden_size, num_heads=4, dropout_rate=0.1)
+            self.vt_label_attn = MultiAttn(query_dim=self.vt_encoder.text_config.hidden_size, key_dim=self.args.label_hidden_dim, value_dim=self.args.label_hidden_dim, emb_dim=self.args.label_hidden_dim, num_heads=4, dropout_rate=0.1)
         else:
             self.label_vt_attn = None
             self.char_vt_attn = None
             self.vt_label_attn = None
         self.char_label_attn = MultiAttn(query_dim=self.args.char_hidden_dim, key_dim=self.args.label_hidden_dim, value_dim=self.args.label_hidden_dim, emb_dim=self.args.label_hidden_dim, num_heads=4, dropout_rate=0.1)
         # Output Layers #
-        if self.vt_model_name == "hvpnet":
+        if self.ner_model_name == "hvpnet":
             self.fc = nn.Sequential(
-                nn.Linear(self.core.bert.config.hidden_size + self.args.label_hidden_dim, num_labels),
+                nn.Linear(self.vt_encoder.bert.config.hidden_size + self.args.label_hidden_dim, num_labels),
                 nn.LayerNorm(num_labels)
             )
-        elif self.vt_model_name == "mkgformer":
+        elif self.ner_model_name == "mkgformer":
             self.fc = nn.Sequential(
-                nn.Linear(self.core.text_config.hidden_size + self.args.label_hidden_dim, num_labels),
+                nn.Linear(self.vt_encoder.text_config.hidden_size + self.args.label_hidden_dim, num_labels),
                 nn.LayerNorm(num_labels)
             )
         else:
@@ -124,14 +127,10 @@ class DiffusionModel(nn.Module):
         return (recon_targets, recon_emissions, features) if return_features else (recon_targets, recon_emissions)
     
     def get_label_embedding(self, labels=None, attention_mask=None):
-        if labels.shape[-1] != self.num_labels:
-            label_features = F.one_hot(labels, self.num_labels).to(torch.float32)
-        else:
-            label_features = labels
+        label_features = self.label_embedding_table[labels]
         label_features = self.label_mlp(label_features)
         label_features = self.label_pos_encoder(label_features)
         label_features = self.label_self_attn(query=label_features, key=label_features, value=label_features, mask=attention_mask) # (bsz, len, label_hidden_dim)
-        label_features = self.label_layer_norm(label_features)
         return label_features
     
     def get_context_embedding(self, char_input_ids=None, input_ids=None, attention_mask=None, token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None):
@@ -148,30 +147,10 @@ class DiffusionModel(nn.Module):
         char_features = self.char_lstm_mlp(char_features)
         char_features = self.char_self_attn(query=char_features, key=char_features, value=char_features, mask=attention_mask) # (bsz, len, char_hidden_dim)
         # Visual-Textual Features #
-        if self.vt_model_name == "hvpnet":
-            sequence_output = self.core(input_ids, attention_mask, token_type_ids, images, aux_imgs)
-        elif self.vt_model_name == "mkgformer":
-            out = self.core(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, pixel_values=images, aux_values=aux_imgs, rcnn_values=rcnn_imgs, return_dict=True)
+        if self.ner_model_name == "hvpnet":
+            sequence_output = self.vt_encoder(input_ids, attention_mask, token_type_ids, images, aux_imgs)
+        elif self.ner_model_name == "mkgformer":
+            out = self.vt_encoder(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, pixel_values=images, aux_values=aux_imgs, rcnn_values=rcnn_imgs, return_dict=True)
             sequence_output = out.last_hidden_state
         
         return char_features, sequence_output
-    
-class MeanTeacher(nn.Module):
-    def __init__(self, student_model, ema_decay=0.999):
-        super().__init__()
-        self.ema_decay = ema_decay
-        self.teacher_model = deepcopy(student_model)  # Deep copy of student
-        self.teacher_model.eval()  # Teacher should be in eval mode
-
-        # Ensure teacher parameters are not updated by gradients
-        for param in self.teacher_model.parameters():
-            param.requires_grad = False
-
-    def update_teacher(self, student_model):
-        """Update teacher model using exponential moving average (EMA)."""
-        with torch.no_grad():
-            for student_param, teacher_param in zip(student_model.parameters(), self.teacher_model.parameters()):
-                teacher_param.data = self.ema_decay * teacher_param.data + (1 - self.ema_decay) * student_param.data
-
-    def forward(self, t, char_input_ids=None, input_ids=None, attention_mask=None, token_type_ids=None, labels=None, images=None, aux_imgs=None, rcnn_imgs=None, return_features=False):
-        return self.teacher_model(t, char_input_ids, input_ids, attention_mask, token_type_ids, labels, images, aux_imgs, rcnn_imgs, return_features)
