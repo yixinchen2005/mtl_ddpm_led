@@ -89,6 +89,7 @@ class DiffusionModel(nn.Module):
         self.noise_scheduler = NoiseScheduler(timesteps=self.args.train_steps, device=self.args.device)
 
     def forward(self, t, char_input_ids=None, input_ids=None, attention_mask=None, token_type_ids=None, labels=None, images=None, aux_imgs=None, rcnn_imgs=None, return_features=False):
+        attention_mask = 1 - attention_mask
         corrupt_label_embeddings, noise = self.corrupt(t, labels, attention_mask)
         if return_features:
             recon_targets, recon_emissions, recon_features = self.denoise(corrupt_label_embeddings, t, char_input_ids, input_ids, attention_mask, token_type_ids, images, aux_imgs, rcnn_imgs, return_features)
