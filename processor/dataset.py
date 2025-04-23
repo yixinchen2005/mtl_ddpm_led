@@ -72,7 +72,6 @@ class LEDProcessor(object):
         return label_mapping
     
     def get_label_embedding(self):
-        # Mapping to BERT-friendly words
         label2word_mapping = {
             "[PAD]": "[PAD]",
             "O": "other",
@@ -85,25 +84,24 @@ class LEDProcessor(object):
             "B-LOC": "location",
             "I-LOC": "location",
             "X": "unknown",
-            "[CLS]": "[CLS]",  # Keep BERT special tokens
+            "[CLS]": "[CLS]",
             "[SEP]": "[SEP]"
         }
+        assert set(label2word_mapping.keys()) == set(self.LABELS), "Label mapping mismatch"
+        
         embeddings = []
         for label in self.LABELS:
             word = label2word_mapping[label]
-            # Convert word to token ID(s)
             token_ids = self.tokenizer.convert_tokens_to_ids([word])
-            if len(token_ids) != 1 or token_ids[0] == self.tokenizer.unk_token_id:
-                # Handle cases where word isn't in vocab (rare with our mapping)
-                print(f"Warning: {word} not in vocab, using 'unknown'")
-                token_ids = [self.tokenizer.convert_tokens_to_ids("unknown")]
-            # Get embedding from BERT's embedding table
+            assert len(token_ids) == 1 and token_ids[0] != self.tokenizer.unk_token_id, f"Word {word} not in vocab"
+            
             token_id_tensor = torch.tensor([token_ids[0]], dtype=torch.long)
             with torch.no_grad():
-                embedding = self.bert.get_input_embeddings()(token_id_tensor)  # Shape: (1, 768)
-                embeddings.append(embedding.squeeze(0))  # Shape: (768,)
-        # Stack into a table
-        embedding_table = torch.stack(embeddings)  # Shape: (num_labels, 768)
+                embedding = self.bert.get_input_embeddings()(token_id_tensor)  # (1, 768)
+                embeddings.append(embedding.squeeze(0))  # (768,)
+        
+        embedding_table = torch.stack(embeddings)  # (num_labels, 768)
+        assert embedding_table.shape == (len(self.LABELS), 768), "Embedding table shape mismatch"
         return embedding_table
 
 class LEDDataset(Dataset):

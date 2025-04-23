@@ -109,7 +109,7 @@ def main():
     parser.add_argument('--do_adv_train', action='store_true')
     parser.add_argument('--predict', action='store_true')
     parser.add_argument("--max_seq_len", default=128, type=int)
-    parser.add_argument("--max_char_len", default=128, type=int)
+    parser.add_argument("--max_char_len", default=50, type=int)
     parser.add_argument('--use_prompt', action='store_true')
     parser.add_argument('--crf_lr', default=5e-2, type=float, help="learning rate")
     parser.add_argument('--prompt_lr', default=3e-4, type=float, help="learning rate")
