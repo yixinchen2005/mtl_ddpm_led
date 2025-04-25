@@ -2,7 +2,6 @@ import torch, os
 import torch.nn.functional as F
 from torch import nn
 from torchcrf import CRF
-from copy import deepcopy
 from .char_lstm import CharLSTM
 from .bert_model import HMNeTNERModel
 from .unimo_model import UnimoCRFModel
@@ -23,8 +22,8 @@ class NoiseScheduler:
         noise_rate_t = (1 - self.alpha_bar[t]).sqrt().view(-1, 1, 1)
         noisy_x = signal_rate_t * x + noise_rate_t * noise
         if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).float()  # (bsz, 128, 1)
-            noisy_x = mask * noisy_x + (1 - mask) * x  # Preserve padded tokens
+            mask = attention_mask.unsqueeze(-1).float()
+            noisy_x = mask * noisy_x + (1 - mask) * x
         return noisy_x, noise
 
 class DiffusionModel(nn.Module):
@@ -104,12 +103,29 @@ class DiffusionModel(nn.Module):
         self.dropout = nn.Dropout(0.4)
         self.crf = CRF(num_labels, batch_first=True)
         
-    def forward(self, labels, char_input_ids=None, input_ids=None, attention_mask=None, token_type_ids=None, 
-                images=None, aux_imgs=None, rcnn_imgs=None, mode='pretrain', epoch=0):
-        bsz = labels.size(0)
-        assert attention_mask.max() <= 1 and attention_mask.min() >= 0, "Invalid attention_mask"
+    def forward(self, labels=None, char_input_ids=None, input_ids=None, attention_mask=None, 
+                token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None, mode='pretrain', epoch=0):
         self.current_epoch = epoch
+        bsz = input_ids.size(0) if input_ids is not None else labels.size(0)
+        assert attention_mask.max() <= 1 and attention_mask.min() >= 0, "Invalid attention_mask"
+
+        # Compute crf_logits (available in all modes)
+        if self.ner_model_name == "hvpnet":
+            crf_loss, crf_logits, crf_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
+                                                            labels, images, aux_imgs)
+        elif self.ner_model_name == "mkgformer":
+            crf_loss, crf_logits, crf_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
+                                                            labels, images, aux_imgs, rcnn_imgs)
+        else:
+            raise ValueError("Invalid ner_model_name")
+        # CRF loss from ner_model
+        crf_loss = crf_loss if crf_loss is not None else torch.tensor(0.0, device=self.args.device)
+
+        if labels is None:
+            # Inference mode (dev/test): skip diffusion-related computations
+            return None, None, crf_logits
         
+        # Training mode: compute diffusion-related losses
         # Sample timesteps
         t = torch.randint(0, self.args.train_steps, (bsz,), device=self.args.device)
         
@@ -124,17 +140,6 @@ class DiffusionModel(nn.Module):
         
         # Diffusion loss
         mse_loss = F.mse_loss(predicted_noise, noise)
-        
-        # CRF loss from ner_model
-        if self.ner_model_name == "hvpnet":
-            crf_loss, crf_logits, crf_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
-                                                            labels, images, aux_imgs)
-        elif self.ner_model_name == "mkgformer":
-            crf_loss, crf_logits, crf_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
-                                                            labels, images, aux_imgs, rcnn_imgs)
-        else:
-            raise ValueError("Invalid ner_model_name")
-        crf_loss = crf_loss if crf_loss is not None else torch.tensor(0.0, device=self.args.device)
         
         # CRF loss from denoise
         pseudo_labels = labels  # Use targets_unk in pre-training
@@ -158,7 +163,58 @@ class DiffusionModel(nn.Module):
         else:
             raise ValueError("Invalid mode")
         
-        return loss, recon_emissions
+        return loss, recon_emissions, crf_logits
+    
+    def reverse_diffusion(self, char_input_ids, input_ids, attention_mask, token_type_ids, 
+                         images, aux_imgs, rcnn_imgs, steps=100):
+        batch_size, seq_len = input_ids.shape
+        
+        # Initialize with random noise
+        label_embeddings = torch.randn(batch_size, seq_len, self.args.label_hidden_dim, device=self.args.device)
+        
+        # Reverse diffusion (DDPM)
+        for t in range(steps - 1, -1, -1):
+            t_tensor = torch.full((batch_size,), t, device=self.args.device, dtype=torch.long)
+            _, predicted_noise, _ = self.denoise(
+                label_embeddings,
+                t_tensor,
+                char_input_ids,
+                input_ids,
+                attention_mask,
+                token_type_ids,
+                images,
+                aux_imgs,
+                rcnn_imgs,
+                return_features=True
+            )
+            # DDPM reverse step
+            alpha_bar_t = self.noise_scheduler.alpha_bar[t].view(-1, 1, 1)
+            alpha_t = self.noise_scheduler.alpha[t].view(-1, 1, 1)
+            sigma_t = torch.sqrt(1 - alpha_bar_t) * torch.sqrt(1 - alpha_t) / torch.sqrt(alpha_bar_t)
+            
+            # x_{t-1} = (x_t - (1-α_t)/√(1-ᾱ_t) * predicted_noise) / √α_t + σ_t * z
+            coeff = (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)
+            label_embeddings = (label_embeddings - coeff * predicted_noise) / torch.sqrt(alpha_t)
+            if t > 0:
+                z = torch.randn_like(label_embeddings)
+                label_embeddings += sigma_t * z
+        
+        # Final denoising at t=0
+        recon_emissions, _, _ = self.denoise(
+            label_embeddings,
+            torch.zeros(batch_size, device=self.args.device, dtype=torch.long),
+            char_input_ids,
+            input_ids,
+            attention_mask,
+            token_type_ids,
+            images,
+            aux_imgs,
+            rcnn_imgs,
+            return_features=True
+        )
+        
+        diffusion_logits = recon_emissions.argmax(dim=-1)
+        return diffusion_logits
     
     def corrupt(self, t, labels=None, attention_mask=None):
         label_features = self.get_label_embedding(labels, attention_mask)
