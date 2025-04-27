@@ -53,8 +53,8 @@ AUX_PATH = {
 }
 
 RCNN_PATH = {
-    'twitter15': 'data/NER_data/twitter15_detect/crops',
-    'twitter17': 'data/NER_data/twitter17_detect/crops'
+    'twitter15': 'data/NER_data/',
+    'twitter17': 'data/NER_data/'
 }
 
 CLSTM_PATH = {
@@ -85,7 +85,7 @@ def main():
     parser.add_argument("--lm_name", default="bert-base-uncased", type=str, help="Pretrained language model.")
     parser.add_argument("--char_hidden_dim", default=512, type=int, help="Dimension of Character-level LSTM hidden embeddings.")
     parser.add_argument('--label_hidden_dim', default=256, type=int, help="Hidden dimensions of label features.")
-    parser.add_argument('--time_hidden_dim', default=128, type=int, help="Hidden dimensions of time.")
+    parser.add_argument('--time_hidden_dim', default=256, type=int, help="Hidden dimensions of time.")
     parser.add_argument('--prompt_len', default=10, type=int, help="Prompt length.")
     parser.add_argument('--prompt_dim', default=800, type=int, help="Mid dimension of prompt project layer.")
     parser.add_argument('--noise_dim', default=128, type=int, help="Dimensions of noises.")
@@ -153,7 +153,7 @@ def main():
     # Initialize processor
     processor = LEDProcessor(data_path, clstm_path, args)
     label_mapping = processor.get_label_mapping()
-    label_embeddings = processor.get_label_embedding()
+    label_embeddings = processor.get_label_embedding().to(args.device)
     num_labels = len(label_mapping)
 
     # Unlabeled dataset (pretrain)
@@ -230,7 +230,7 @@ def main():
         model = DiffusionModel(
             args=args,
             num_labels=num_labels,
-            label_embeddings=label_embeddings,
+            label_embedding_table=label_embeddings,
             clstm_path=clstm_path,
             ner_model_name=args.ner_model_name
         ).to(args.device)
@@ -244,8 +244,8 @@ def main():
             logger=logger,
             metrics_file=metrics_file
         )
-        logger.info("Starting pre-training...")
-        trainer.train()
+        # logger.info("Starting pre-training...")
+        # trainer.train()
         diffusion_f1 = trainer.test()
         logger.info(f"Pre-training test Diffusion F1: {diffusion_f1:.4f}")
 
@@ -256,7 +256,7 @@ def main():
         model = DiffusionModel(
             args=args,
             num_labels=num_labels,
-            label_embeddings=label_embeddings,
+            label_embedding_table=label_embeddings,
             clstm_path=clstm_path,
             ner_model_name=args.ner_model_name
         ).to(args.device)
@@ -285,7 +285,7 @@ def main():
         model = DiffusionModel(
             args=args,
             num_labels=num_labels,
-            label_embeddings=label_embeddings,
+            label_embedding_table=label_embeddings,
             clstm_path=clstm_path,
             ner_model_name=args.ner_model_name
         ).to(args.device)

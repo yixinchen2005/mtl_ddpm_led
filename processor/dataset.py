@@ -393,10 +393,11 @@ class LEDDataset(Dataset):
             
             rcnn_imgs = torch.stack(rcnn_imgs)
 
+        # Return tensors, using zeros if None
         return (
-            hvp_img or torch.zeros(3, 224, 224),
-            hvp_aux_imgs or torch.zeros(3, 3, 224, 224),
-            mkg_img or torch.zeros(3, 224, 224),
-            mkg_aux_imgs or torch.zeros(3, 3, self.aux_size, self.aux_size),
-            rcnn_imgs or torch.zeros(3, 3, self.rcnn_size, self.rcnn_size)
+            hvp_img if hvp_img is not None else torch.zeros(3, 224, 224),
+            hvp_aux_imgs if hvp_aux_imgs is not None else torch.zeros(3, 3, self.aux_size, self.aux_size),
+            mkg_img if mkg_img is not None else torch.zeros(3, 224, 224),
+            mkg_aux_imgs if mkg_aux_imgs is not None else torch.zeros(3, 3, self.aux_size, self.aux_size),
+            rcnn_imgs if rcnn_imgs is not None else torch.zeros(3, 3, self.rcnn_size, self.rcnn_size)
         )
