@@ -12,7 +12,9 @@ import random
 import csv
 from processor.dataset import LEDProcessor, LEDDataset
 from models.mtl_ddpm_model import DiffusionModel
-from modules.ddpm_train import PreTrainer
+from models.bert_model import HMNeTNERModel
+from models.unimo_model import UnimoCRFModel
+from modules.ddpm_train import PreTrainer, NERTrainer
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -92,6 +94,7 @@ def main():
     parser.add_argument('--load_path', default=None, type=str, help="Path to load model for fine-tuning or prediction.")
     parser.add_argument('--save_path', default="./models", type=str, help="Path to save model.")
     parser.add_argument('--notes', default="", type=str, help="Remarks for save path directory.")
+    parser.add_argument("--do_ner_train", action="store_true")
     parser.add_argument('--do_pretrain', action='store_true', help="Run pre-training.")
     parser.add_argument('--do_fine_tune', action='store_true', help="Run fine-tuning.")
     parser.add_argument('--predict', action='store_true', help="Run prediction.")
@@ -225,8 +228,8 @@ def main():
         )
         logger.info(f"Labeled dataset: train={len(train_dataset_labeled)}, val={len(val_dataset_labeled)}, test={len(test_dataset_labeled)}")
 
-    # Pre-training
-    if args.do_pretrain:
+    # Initialize model
+    if args.do_pretrain or args.do_fine_tune:
         model = DiffusionModel(
             args=args,
             num_labels=num_labels,
@@ -234,6 +237,30 @@ def main():
             clstm_path=clstm_path,
             ner_model_name=args.ner_model_name
         ).to(args.device)
+    elif args.do_ner_train:
+        if args.ner_model_name == "hvpnet":
+            model = HMNeTNERModel(num_labels=num_labels, args=args).to(args.device)
+        elif args.ner_model_name == "mkgformer":
+            model = UnimoCRFModel(num_labels=num_labels, args=args).to(args.device)
+    
+    if args.do_ner_train:
+        trainer = NERTrainer(
+            train_data=train_dataloader_unlabeled,
+            val_data=val_dataloader_unlabeled,
+            test_data=test_dataloader_unlabeled,
+            model=model,
+            label_map=label_mapping,
+            args=args,
+            logger=logger,
+            metrics_file=os.path.join(args.save_path, f"metrics_ner_{args.ner_model_name}.csv")
+        )
+        logger.info(f"Starting training the {args.ner_model_name} model ...")
+        trainer.train()
+        ner_f1 = trainer.test()
+        logger.info(f"Fine-tuning test Diffusion F1: {ner_f1:.4f}")
+    
+    # Pre-training
+    if args.do_pretrain:
         trainer = PreTrainer(
             train_data=train_dataloader_unlabeled,
             val_data=val_dataloader_unlabeled,
@@ -244,8 +271,8 @@ def main():
             logger=logger,
             metrics_file=metrics_file
         )
-        # logger.info("Starting pre-training...")
-        # trainer.train()
+        logger.info("Starting pre-training...")
+        trainer.train()
         diffusion_f1 = trainer.test()
         logger.info(f"Pre-training test Diffusion F1: {diffusion_f1:.4f}")
 
@@ -253,13 +280,6 @@ def main():
     if args.do_fine_tune:
         if not train_dataloader_labeled:
             raise ValueError("Labeled dataset is empty; cannot fine-tune.")
-        model = DiffusionModel(
-            args=args,
-            num_labels=num_labels,
-            label_embedding_table=label_embeddings,
-            clstm_path=clstm_path,
-            ner_model_name=args.ner_model_name
-        ).to(args.device)
         if args.load_path:
             model.load_state_dict(torch.load(args.load_path))
             logger.info(f"Loaded model from {args.load_path}")
@@ -278,40 +298,40 @@ def main():
         diffusion_f1 = trainer.test()
         logger.info(f"Fine-tuning test Diffusion F1: {diffusion_f1:.4f}")
 
-    # Prediction
-    if args.predict:
-        if not test_dataloader_labeled:
-            raise ValueError("Labeled test dataset is empty; cannot predict.")
-        model = DiffusionModel(
-            args=args,
-            num_labels=num_labels,
-            label_embedding_table=label_embeddings,
-            clstm_path=clstm_path,
-            ner_model_name=args.ner_model_name
-        ).to(args.device)
-        if args.load_path:
-            model.load_state_dict(torch.load(args.load_path))
-            logger.info(f"Loaded model from {args.load_path}")
-        trainer = PreTrainer(
-            train_data=None,
-            val_data=None,
-            test_data=test_dataloader_labeled,
-            model=model,
-            label_map=label_mapping,
-            args=args,
-            logger=logger,
-            metrics_file=metrics_file
-        )
-        logger.info("Generating predictions...")
-        predictions = trainer.predict()
-        output_file = os.path.join(args.save_path, f"{args.dataset_name}_predictions.csv")
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write("img_name,word,pred_label\n")
-            for img_name, words, pred_labels in predictions:
-                for word, label in zip(words, pred_labels):
-                    if word not in ['[CLS]', '[SEP]', '[PAD]'] and label != label_mapping['[PAD]']:
-                        f.write(f"{img_name},{word},{label}\n")
-        logger.info(f"Predictions saved to {output_file}")
+    # # Prediction
+    # if args.predict:
+    #     if not test_dataloader_labeled:
+    #         raise ValueError("Labeled test dataset is empty; cannot predict.")
+    #     model = DiffusionModel(
+    #         args=args,
+    #         num_labels=num_labels,
+    #         label_embedding_table=label_embeddings,
+    #         clstm_path=clstm_path,
+    #         ner_model_name=args.ner_model_name
+    #     ).to(args.device)
+    #     if args.load_path:
+    #         model.load_state_dict(torch.load(args.load_path))
+    #         logger.info(f"Loaded model from {args.load_path}")
+    #     trainer = PreTrainer(
+    #         train_data=None,
+    #         val_data=None,
+    #         test_data=test_dataloader_labeled,
+    #         model=model,
+    #         label_map=label_mapping,
+    #         args=args,
+    #         logger=logger,
+    #         metrics_file=metrics_file
+    #     )
+    #     logger.info("Generating predictions...")
+    #     predictions = trainer.predict()
+    #     output_file = os.path.join(args.save_path, f"{args.dataset_name}_predictions.csv")
+    #     with open(output_file, 'w', encoding='utf-8') as f:
+    #         f.write("img_name,word,pred_label\n")
+    #         for img_name, words, pred_labels in predictions:
+    #             for word, label in zip(words, pred_labels):
+    #                 if word not in ['[CLS]', '[SEP]', '[PAD]'] and label != label_mapping['[PAD]']:
+    #                     f.write(f"{img_name},{word},{label}\n")
+    #     logger.info(f"Predictions saved to {output_file}")
 
 if __name__ == "__main__":
     main()
