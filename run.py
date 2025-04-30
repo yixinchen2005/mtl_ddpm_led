@@ -107,6 +107,7 @@ def main():
     parser.add_argument('--rcnn_size', default=128, type=int, help="RCNN image size.")
     parser.add_argument('--train_steps', default=1000, type=int, help="Timesteps for diffusion training.")
     parser.add_argument('--eval_steps', default=100, type=int, help="Timesteps for diffusion inference.")
+    parser.add_argument('--patience', default=5, type=int, help="Threshold for early stopping.")
     parser.add_argument('--lambda_id', default=1.0, type=float, help="Identity loss weight.")
     parser.add_argument('--lambda_edit', default=1.0, type=float, help="Edit loss weight.")
     parser.add_argument('--lambda_cycle', default=1.0, type=float, help="Cycle loss weight.")

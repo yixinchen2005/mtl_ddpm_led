@@ -13,6 +13,7 @@ class BaseTrainer(object):
         self.logger = logger
         self.metrics_file = metrics_file
         self.refresh_step = 2
+        self.no_improve = 0
         self.step = 0
 
     def train(self):
@@ -67,8 +68,7 @@ class NERTrainer(BaseTrainer):
         self.logger.info("  Evaluate begin = %d", self.args.eval_begin_epoch)
 
         self.step = 0
-        patience = 5
-        no_improve = 0
+        self.no_improve = 0
         with tqdm(total=self.train_num_steps, postfix="loss:{0:<6.5f}", leave=False, dynamic_ncols=True, initial=self.step) as pbar:
             avg_loss, loss_count = 0, 0
             for epoch in range(self.args.num_epochs):
@@ -135,11 +135,11 @@ class NERTrainer(BaseTrainer):
                 if epoch >= self.args.eval_begin_epoch:
                     ner_f1 = self.evaluate(epoch)
                     if ner_f1 < self.best_dev:
-                        no_improve += 1
+                        self.no_improve += 1
                     else:
-                        no_improve = 0
+                        self.no_improve = 0
                         self.best_dev = ner_f1
-                    if no_improve >= patience:
+                    if self.no_improve >= self.patience:
                         self.logger.info(f"Early stopping at epoch {epoch + 1}")
                         break
 
@@ -215,10 +215,10 @@ class NERTrainer(BaseTrainer):
     def _step(self, batch, mode="train", epoch=0):
         # Extract data
         if self.args.use_prompt:
-            (targets_unk, char_input_ids, input_ids, token_type_ids, attention_mask,
+            (targets_unk, _, input_ids, token_type_ids, attention_mask,
              hvp_imgs, hvp_aux_imgs, mkg_imgs, mkg_aux_imgs, rcnn_imgs, words, img_names) = batch
         else:
-            (targets_unk, char_input_ids, input_ids, token_type_ids, attention_mask, words, img_names) = batch
+            (targets_unk, _, input_ids, token_type_ids, attention_mask, words, img_names) = batch
             hvp_imgs, hvp_aux_imgs, mkg_imgs, mkg_aux_imgs, rcnn_imgs = None, None, None, None, None
         words = list(map(list, zip(*words)))
 
@@ -235,7 +235,7 @@ class NERTrainer(BaseTrainer):
         # Forward pass
         if mode in ["train", "dev", "test"]:
             if self.args.ner_model_name == "hvpnet":
-                loss, ner_logits, probs = self.model(
+                loss, ner_logits, _ = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     token_type_ids=token_type_ids,
@@ -244,7 +244,7 @@ class NERTrainer(BaseTrainer):
                     aux_imgs=aux_imgs
                 )
             elif self.args.ner_model_name == "mkgformer":
-                loss, ner_logits, probs = self.model(
+                loss, ner_logits, _ = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     token_type_ids=token_type_ids,
@@ -490,7 +490,8 @@ class PreTrainer(BaseTrainer):
 
                 # Evaluate if needed
                 if epoch >= self.args.eval_begin_epoch:
-                    self.evaluate(epoch)
+                    if self.evaluate(epoch):
+                        break # Early stopping
 
             torch.cuda.empty_cache()
             pbar.close()
@@ -511,18 +512,35 @@ class PreTrainer(BaseTrainer):
                 (ner_precision, ner_recall, ner_f1), (diffusion_precision, diffusion_recall, diffusion_f1), val_loss = self._eval_labels(
                     pbar, self.val_data, epoch, "dev"
                 )
-                self.logger.info("Epoch {}/{}, NER Precision: {:<6.5f}, Recall: {:<6.5f}, F1: {:<6.5f}".format(
-                    epoch + 1, self.args.num_epochs, ner_precision, ner_recall, ner_f1))
+                # Moving average for NER F1
+                if not hasattr(self, 'ner_f1_history'):
+                    self.ner_f1_history = []
+                self.ner_f1_history.append(ner_f1)
+                if len(self.ner_f1_history) > 3:
+                    self.ner_f1_history.pop(0)
+                avg_ner_f1 = sum(self.ner_f1_history) / len(self.ner_f1_history)
+                
+                self.logger.info("Epoch {}/{}, NER Precision: {:<6.5f}, Recall: {:<6.5f}, F1: {:<6.5f}, Avg F1: {:<6.5f}".format(
+                    epoch + 1, self.args.num_epochs, ner_precision, ner_recall, ner_f1, avg_ner_f1))
                 self.logger.info("Epoch {}/{}, Diffusion Precision: {:<6.5f}, Recall: {:<6.5f}, F1: {:<6.5f}, Best F1: {:<6.5f}, Best Epoch: {}".format(
                     epoch + 1, self.args.num_epochs, diffusion_precision, diffusion_recall, diffusion_f1, 
                     self.best_dev, self.best_dev_epoch))
-                if diffusion_f1 >= self.best_dev:
-                    self.logger.info("Get better performance at epoch {}".format(epoch + 1))
-                    self.best_dev_epoch = epoch + 1
+                # Update pseudo-label state
+                self.model.update_pseudo_label_state(ner_f1)
+                self.logger.info(f"Epoch {epoch + 1}, NER F1: {ner_f1:.4f}, Using Pseudo-Labels: {self.model.use_pseudo_labels}")
+                # Early stopping based on diffusion F1, with relaxed NER F1 threshold
+                if diffusion_f1 >= self.best_dev and avg_ner_f1 >= 0.70:
                     self.best_dev = diffusion_f1
+                    self.best_dev_epoch = epoch + 1
+                    self.no_improve = 0
                     if self.args.save_path:
                         torch.save(self.model.state_dict(), self.best_model_path)
-                        self.logger.info(f"Saved best model (F1: {diffusion_f1:.4f}) to {self.best_model_path}")
+                        self.logger.info(f"Saved best model (Diffusion F1: {diffusion_f1:.4f}, NER F1: {ner_f1:.4f}) to {self.best_model_path}")
+                else:
+                    self.no_improve += 1
+                    if self.no_improve >= self.args.patience:
+                        self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
+                        return True  # Signal early stopping
                 # Log to CSV
                 if self.metrics_file:
                     with open(self.metrics_file, 'a', newline='') as f:
@@ -530,7 +548,7 @@ class PreTrainer(BaseTrainer):
                         writer.writerow([epoch + 1, "val", val_loss, ner_f1, diffusion_f1])
 
         self.model.train()
-        return ner_f1, diffusion_f1
+        return False
     
     def test(self):
         self.model.eval()
@@ -565,7 +583,7 @@ class PreTrainer(BaseTrainer):
         return diffusion_f1
     
     def _step(self, batch, mode="train", epoch=0):
-        # Extract data from a batch #
+        # Extract data
         if self.args.use_prompt:
             (targets_unk, char_input_ids, input_ids, token_type_ids, attention_mask,
             hvp_imgs, hvp_aux_imgs, mkg_imgs, mkg_aux_imgs, rcnn_imgs, words, img_names) = batch
@@ -573,7 +591,8 @@ class PreTrainer(BaseTrainer):
             (targets_unk, char_input_ids, input_ids, token_type_ids, attention_mask, words, img_names) = batch
             hvp_imgs, hvp_aux_imgs, mkg_imgs, mkg_aux_imgs, rcnn_imgs = None, None, None, None, None
         words = list(map(list, zip(*words)))
-        # Specify which images and auxiliary images are feeding into the networks #
+
+        # Select images
         if self.model.ner_model_name == "hvpnet":
             imgs = hvp_imgs
             aux_imgs = hvp_aux_imgs
@@ -584,7 +603,7 @@ class PreTrainer(BaseTrainer):
             imgs, aux_imgs = None, None
 
         if mode == "train":
-            loss, recon_emissions, crf_logits = self.model(
+            loss, recon_emissions, ner_logits = self.model(
                 labels=targets_unk,
                 char_input_ids=char_input_ids,
                 input_ids=input_ids,
@@ -598,7 +617,7 @@ class PreTrainer(BaseTrainer):
             )
             diffusion_logits = recon_emissions.argmax(dim=-1)
         elif mode in ["dev", "test", "predict"]:
-            loss, recon_emissions, crf_logits = self.model(
+            _, _, ner_logits = self.model(
                 labels=None,  # Prevent leakage
                 char_input_ids=char_input_ids,
                 input_ids=input_ids,
@@ -618,12 +637,39 @@ class PreTrainer(BaseTrainer):
                 images=imgs,
                 aux_imgs=aux_imgs,
                 rcnn_imgs=rcnn_imgs,
-                steps=self.eval_steps
+                steps=100  # Increased for better denoising
             )
+            # Compute validation loss
+            recon_emissions, _ = self.model.denoise(
+                corrupt_label_embeddings=self.model.corrupt(
+                    torch.zeros(targets_unk.size(0), device=self.args.device, dtype=torch.long),
+                    targets_unk, attention_mask
+                )[0],
+                t=torch.zeros(targets_unk.size(0), device=self.args.device),
+                char_input_ids=char_input_ids, input_ids=input_ids, attention_mask=attention_mask,
+                token_type_ids=token_type_ids, images=imgs, aux_imgs=aux_imgs, rcnn_imgs=rcnn_imgs
+            )
+            # Compute ner_emissions for pseudo-labels
+            if self.model.ner_model_name == "hvpnet":
+                sequence_output = self.model.vt_encoder(input_ids, attention_mask, token_type_ids, imgs, aux_imgs)
+            elif self.model.ner_model_name == "mkgformer":
+                sequence_output = self.model.vt_encoder(input_ids, attention_mask, token_type_ids, imgs, aux_imgs).last_hidden_state
+            else:
+                raise ValueError("Invalid ner_model_name")
+            ner_emissions = self.model.ner_model.fc(sequence_output)
+            pseudo_labels = ner_emissions.argmax(dim=-1).detach() if self.model.use_pseudo_labels else targets_unk
+            loss = -self.model.crf(recon_emissions, pseudo_labels, mask=attention_mask.bool(), reduction='mean')
         else:
             raise ValueError("Invalid mode")
-    
-        return loss, crf_logits, diffusion_logits, targets_unk, attention_mask, words, img_names
+
+        # Log loss components
+        self.logger.debug(f"Epoch {epoch}, Mode {mode}, Total Loss: {loss}, "
+                        f"CRF Loss: {getattr(self.model, 'ner_loss', 0.0) if hasattr(self.model, 'ner_loss') else 0.0}, "
+                        f"MSE Loss: {getattr(self.model, 'mse_loss', 0.0) if hasattr(self.model, 'mse_loss') else 0.0}, "
+                        f"Denoise CRF Loss: {getattr(self.model, 'denoise_crf_loss', 0.0) if hasattr(self.model, 'denoise_crf_loss') else 0.0}, "
+                        f"KL Loss: {getattr(self.model, 'kl_loss', 0.0) if hasattr(self.model, 'kl_loss') else 0.0}")
+        
+        return loss, ner_logits, diffusion_logits, targets_unk, attention_mask, words, img_names
     
     def _gen_labels(self, logits, targets, token_attention_mask, words=None, img_names=None):
         # Debug input types
@@ -690,13 +736,13 @@ class PreTrainer(BaseTrainer):
         
         for batch in data:
             batch = [tup.to(self.args.device) if isinstance(tup, torch.Tensor) else tup for tup in batch]
-            loss, crf_logits, diffusion_logits, targets_unk, attention_mask, words, img_names = self._step(
+            loss, ner_logits, diffusion_logits, targets_unk, attention_mask, words, img_names = self._step(
                 batch, mode, epoch
             )
             total_loss += loss.detach().cpu().item() if loss is not None else 0.0
             batch_count += 1
             given_labels_batch, ner_pred_labels_batch = self._gen_labels(
-                crf_logits, targets_unk, attention_mask, words, img_names
+                ner_logits, targets_unk, attention_mask, words, img_names
             )
             given_labels_batch, diffusion_pred_labels_batch = self._gen_labels(
                 diffusion_logits, targets_unk, attention_mask, words, img_names

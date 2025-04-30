@@ -34,6 +34,10 @@ class DiffusionModel(nn.Module):
         self.args = args
         self.num_labels = num_labels
         self.ner_model_name = ner_model_name
+        # Switch between labels and pseudo-labels
+        self.pseudo_label_f1_threshold = 0.75  # Switch when NER validation F1 > 0.75
+        self.use_pseudo_labels = False  # Track switch state
+        self.current_ner_f1 = 0.0  # Store latest NER validation F1
         # Noise Scheduler
         self.time_mlp = nn.Linear(1, self.args.time_hidden_dim)
         self.noise_scheduler = NoiseScheduler(timesteps=self.args.train_steps, device=self.args.device)
@@ -165,24 +169,33 @@ class DiffusionModel(nn.Module):
         self.crf = CRF(num_labels, batch_first=True)
         
     def forward(self, labels=None, char_input_ids=None, input_ids=None, attention_mask=None, 
-                token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None, mode='pretrain', epoch=0):
+            token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None, mode='pretrain', epoch=0):
         self.current_epoch = epoch
         bsz = input_ids.size(0) if input_ids is not None else labels.size(0)
         assert attention_mask.max() <= 1 and attention_mask.min() >= 0, "Invalid attention_mask"
 
-        # Compute crf_logits (available in all modes)
+        # Compute NER outputs
         if self.ner_model_name == "hvpnet":
-            crf_loss, crf_logits, crf_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
+            ner_loss, ner_logits, ner_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
                                                             labels, images, aux_imgs)
         elif self.ner_model_name == "mkgformer":
-            crf_loss, crf_logits, crf_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
+            ner_loss, ner_logits, ner_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
                                                             labels, images, aux_imgs, rcnn_imgs)
         else:
             raise ValueError("Invalid ner_model_name")
-        crf_loss = crf_loss if crf_loss is not None else torch.tensor(0.0, device=self.args.device)
+        ner_loss = ner_loss if ner_loss is not None else torch.tensor(0.0, device=self.args.device)
+
+        # Compute ner_emissions for pseudo-labels
+        if self.ner_model_name == "hvpnet":
+            sequence_output = self.vt_encoder(input_ids, attention_mask, token_type_ids, images, aux_imgs)
+        elif self.ner_model_name == "mkgformer":
+            sequence_output = self.vt_encoder(input_ids, attention_mask, token_type_ids, images, aux_imgs).last_hidden_state
+        else:
+            raise ValueError("Invalid ner_model_name")
+        ner_emissions = self.ner_model.fc(sequence_output)  # [bsz, seq_len, num_labels]
 
         if labels is None:
-            return None, None, crf_logits
+            return None, None, ner_logits
         
         t = torch.randint(0, self.args.train_steps, (bsz,), device=self.args.device)
         corrupt_label_embeddings, noise = self.corrupt(t, labels, attention_mask)
@@ -191,25 +204,39 @@ class DiffusionModel(nn.Module):
             token_type_ids, images, aux_imgs, rcnn_imgs
         )
         
+        # MSE loss for noise prediction
         mse_loss = F.mse_loss(predicted_noise, noise)
-        pseudo_labels = labels
+        # Pseudo-labels: Use NER F1 threshold
+        if not self.use_pseudo_labels:
+            pseudo_labels = labels  # targets_unk
+        else:
+            pseudo_labels = ner_emissions.argmax(dim=-1).detach()  # NER pseudo-labels from emissions
         denoise_crf_loss = -self.crf(recon_emissions, pseudo_labels, mask=attention_mask.bool(), reduction='mean')
         recon_probs = F.softmax(recon_emissions, dim=-1)
-        kl_loss = F.kl_div(recon_probs.log(), crf_probs, reduction='batchmean') if mode != 'pretrain' else 0.0
+        kl_loss = F.kl_div(recon_probs.log(), ner_probs, reduction='batchmean') if mode == 'pretrain' and self.use_pseudo_labels else 0.0
         
-        denoise_weight = 0.2 * min(1.0, (self.current_epoch - 4) / 5) if mode == 'pretrain' and self.current_epoch >= 5 else 0.0
-        mse_weight = 1.5 if mode == 'pretrain' and self.current_epoch < 5 else 1.0
+        # Loss weights
+        ner_weight = 0.8 if mode == 'pretrain' else 0.0
+        denoise_weight = 0.1 if mode == 'pretrain' and self.use_pseudo_labels else 0.0
+        mse_weight = 0.5 if mode == 'pretrain' else 0.0
+        kl_weight = 0.1 if mode == 'pretrain' and self.use_pseudo_labels else 0.0
         
         if mode == 'pretrain':
-            loss = mse_weight * mse_loss + 0.5 * crf_loss + denoise_weight * denoise_crf_loss
+            loss = ner_weight * ner_loss + mse_weight * mse_loss + denoise_weight * denoise_crf_loss + kl_weight * kl_loss
         elif mode == 'finetune_forward':
-            loss = denoise_crf_loss + 0.5 * crf_loss + 0.1 * kl_loss
+            loss = denoise_crf_loss + 0.5 * ner_loss + 0.1 * kl_loss
         elif mode == 'finetune_backward':
-            loss = denoise_crf_loss + 0.5 * crf_loss + 0.1 * kl_loss
+            loss = denoise_crf_loss + 0.5 * ner_loss + 0.1 * kl_loss
         else:
             raise ValueError("Invalid mode")
         
-        return loss, recon_emissions, crf_logits
+        # Store loss components for logging
+        self.ner_loss = ner_loss
+        self.mse_loss = mse_loss
+        self.denoise_crf_loss = denoise_crf_loss
+        self.kl_loss = kl_loss
+        
+        return loss, recon_emissions, ner_logits
     
     def reverse_diffusion(self, char_input_ids, input_ids, attention_mask, token_type_ids, 
                          images, aux_imgs, rcnn_imgs, steps=100):
@@ -361,3 +388,9 @@ class DiffusionModel(nn.Module):
         assert vt_features.shape == (bsz, self.args.max_seq_len, self.vt_hidden_size), "VT output shape mismatch"
         
         return char_features, vt_features
+    
+    def update_pseudo_label_state(self, ner_f1):
+        """Update whether to use pseudo-labels based on MNER F1."""
+        self.current_ner_f1 = ner_f1
+        if ner_f1 >= self.pseudo_label_f1_threshold:
+            self.use_pseudo_labels = True
