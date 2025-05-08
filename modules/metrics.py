@@ -45,17 +45,46 @@ def eval_result(true_labels, pred_result, rel2id, logger, use_name=False):
     logger.info('Evaluation result: {}.'.format(result))
     return result
 
+def comp_f1_score(targets_new, targets_old, pred_new):
+    """
+    Compute the F1 score for error detection by comparing true errors (targets_new != targets_old)
+    with detected errors (pred_new != targets_old).
+
+    Parameters:
+    targets_new: Tensor or array [bsz, seq_len], corrected ground-truth labels.
+    targets_old: Tensor or array [bsz, seq_len], noisy ground-truth labels.
+    pred_new: Tensor or array [bsz, seq_len], predicted denoised labels.
+
+    Returns:
+    precision: Precision of error detection.
+    recall: Recall of error detection.
+    f1_score: F1 score of error detection.
+    """
+    true_issues, detect_issues = [], []
+    # Identify true errors
+    for i, (seq_n, seq_o) in enumerate(zip(targets_new, targets_old)):
+        for j, (l_n, l_o) in enumerate(zip(seq_n, seq_o)):
+            if l_n != l_o:
+                true_issues.append((i, j))
+    # Identify detected errors
+    for i, (seq_p, seq_o) in enumerate(zip(pred_new, targets_old)):
+        for j, (l_p, l_o) in enumerate(zip(seq_p, seq_o)):
+            if l_p != l_o:
+                detect_issues.append((i, j))
+    
+    precision, recall, f1_score = comp_score(true_issues, detect_issues)
+    return precision, recall, f1_score
+
 def comp_score(true_issues, detected_issues):
     """
-    Compute the f1_score of the error detection results.
-    
+    Compute precision, recall, and F1 score for error detection.
+
     Parameters:
-    true_issues: a list of tuples, (seq_idx, label_idx), obtained by comparing given ground-truth labels with
-        corrected ground-truth labels.
-    detected_issues: a list of tuples, (seq_idx, label_idx), obtained by calling another algorithm.
-    
+    true_issues: List of tuples (seq_idx, label_idx), true error positions.
+    detected_issues: List of tuples (seq_idx, label_idx), detected error positions.
+
     Returns:
-    f1_score: the f1 score.
+    precision, recall, f1_score: Error detection metrics.
     """
     true_positive, false_positive, false_negative = 0, 0, 0
     for issue in detected_issues:
@@ -70,21 +99,3 @@ def comp_score(true_issues, detected_issues):
     recall = true_positive / (true_positive + false_negative + 1e-8)
     f1_score = (2 * true_positive) / (2 * true_positive + false_positive + false_negative + 1e-8)
     return precision, recall, f1_score
-
-def comp_f1_score(targets_new, targets_old, pred_forward_old, pred_reverse_new):
-        true_issues, detect_issues_forward, detect_issues_reverse = [], [], []
-        for i, (seq_n, seq_o) in enumerate(zip(targets_new, targets_old)):
-            for j, (l_n, l_o) in enumerate(zip(seq_n, seq_o)):
-                if l_n != l_o:
-                    true_issues.append((i, j))
-        for i, (seq_p, seq_t) in enumerate(zip(pred_forward_old, targets_old)):
-            for j, (l_p, l_t) in enumerate(zip(seq_p, seq_t)):
-                if l_p != l_t:
-                    detect_issues_forward.append((i, j))
-        for i, (seq_p, seq_t) in enumerate(zip(pred_reverse_new, targets_new)):
-            for j, (l_p, l_t) in enumerate(zip(seq_p, seq_t)):
-                if l_p != l_t:
-                    detect_issues_reverse.append((i, j))
-        precision_forward, recall_forward, f1_score_forward = comp_score(true_issues, detect_issues_forward)
-        precision_reverse, recall_reverse, f1_score_reverse = comp_score(true_issues, detect_issues_reverse)
-        return precision_forward, recall_forward, f1_score_forward, precision_reverse, recall_reverse, f1_score_reverse
