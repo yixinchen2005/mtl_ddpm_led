@@ -1,3 +1,5 @@
+import numpy as np
+
 def eval_result(true_labels, pred_result, rel2id, logger, use_name=False):
     correct = 0
     total = len(true_labels)
@@ -48,30 +50,35 @@ def eval_result(true_labels, pred_result, rel2id, logger, use_name=False):
 def comp_f1_score(targets_new, targets_old, pred_new):
     """
     Compute the F1 score for error detection by comparing true errors (targets_new != targets_old)
-    with detected errors (pred_new != targets_old).
+    with detected errors (pred_new != targets_old) using list operations.
 
     Parameters:
-    targets_new: Tensor or array [bsz, seq_len], corrected ground-truth labels.
-    targets_old: Tensor or array [bsz, seq_len], noisy ground-truth labels.
-    pred_new: Tensor or array [bsz, seq_len], predicted denoised labels.
+    targets_new: List of lists [bsz, seq_len], corrected ground-truth label indices.
+    targets_old: List of lists [bsz, seq_len], noisy ground-truth label indices.
+    pred_new: List of lists [bsz, seq_len], predicted denoised label indices.
 
     Returns:
     precision: Precision of error detection.
     recall: Recall of error detection.
     f1_score: F1 score of error detection.
     """
-    true_issues, detect_issues = [], []
-    # Identify true errors
-    for i, (seq_n, seq_o) in enumerate(zip(targets_new, targets_old)):
-        for j, (l_n, l_o) in enumerate(zip(seq_n, seq_o)):
-            if l_n != l_o:
-                true_issues.append((i, j))
-    # Identify detected errors
-    for i, (seq_p, seq_o) in enumerate(zip(pred_new, targets_old)):
-        for j, (l_p, l_o) in enumerate(zip(seq_p, seq_o)):
-            if l_p != l_o:
-                detect_issues.append((i, j))
+    # Validate inputs
+    if not (len(targets_new) == len(targets_old) == len(pred_new)):
+        raise ValueError("Input lists must have the same number of sequences")
     
+    # Identify true error positions (targets_new != targets_old) and detected error positions (pred_new != targets_old)
+    true_issues = []
+    detect_issues = []
+    for seq_idx in range(len(targets_new)):
+        if not (len(targets_new[seq_idx]) == len(targets_old[seq_idx]) == len(pred_new[seq_idx])):
+            raise ValueError(f"Sequence {seq_idx} has mismatched lengths")
+        for label_idx in range(len(targets_new[seq_idx])):
+            if targets_new[seq_idx][label_idx] != targets_old[seq_idx][label_idx]:
+                true_issues.append((seq_idx, label_idx))
+            if pred_new[seq_idx][label_idx] != targets_old[seq_idx][label_idx]:
+                detect_issues.append((seq_idx, label_idx))
+
+    # Compute precision, recall, and F1 score
     precision, recall, f1_score = comp_score(true_issues, detect_issues)
     return precision, recall, f1_score
 
