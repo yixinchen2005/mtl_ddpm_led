@@ -83,99 +83,99 @@ class DiffusionModel(nn.Module):
         self.vt_hidden_size = vt_hidden_size
         # Cross Attention (1st Block)
         self.label_vt_attn = MultiAttn(
-            query_dim=self.args.label_hidden_dim,  # 256
-            key_dim=vt_hidden_size,               # 768
-            value_dim=vt_hidden_size,             # 768
-            emb_dim=self.args.label_hidden_dim,   # 256
+            query_dim=self.args.label_hidden_dim,
+            key_dim=vt_hidden_size,
+            value_dim=vt_hidden_size,
+            emb_dim=self.args.label_hidden_dim,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.label_char_attn = MultiAttn(
-            query_dim=self.args.label_hidden_dim,  # 256
-            key_dim=self.args.char_hidden_dim,    # 512
-            value_dim=self.args.char_hidden_dim,  # 512
-            emb_dim=self.args.label_hidden_dim,   # 256
+            query_dim=self.args.label_hidden_dim,
+            key_dim=self.args.char_hidden_dim,
+            value_dim=self.args.char_hidden_dim,
+            emb_dim=self.args.label_hidden_dim,
             num_heads=4,
             dropout_rate=0.4
         )
         self.char_vt_attn = MultiAttn(
-            query_dim=self.args.char_hidden_dim,  # 512
-            key_dim=vt_hidden_size,              # 768
-            value_dim=vt_hidden_size,            # 768
-            emb_dim=self.args.char_hidden_dim,   # 512
+            query_dim=self.args.char_hidden_dim,
+            key_dim=vt_hidden_size,
+            value_dim=vt_hidden_size,
+            emb_dim=self.args.char_hidden_dim,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.char_label_attn = MultiAttn(
-            query_dim=self.args.char_hidden_dim,   # 512
-            key_dim=self.args.label_hidden_dim,   # 256
-            value_dim=self.args.label_hidden_dim, # 256
-            emb_dim=self.args.char_hidden_dim,    # 512
+            query_dim=self.args.char_hidden_dim,
+            key_dim=self.args.label_hidden_dim,
+            value_dim=self.args.label_hidden_dim,
+            emb_dim=self.args.char_hidden_dim,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.vt_label_attn = MultiAttn(
-            query_dim=vt_hidden_size,             # 768
-            key_dim=self.args.label_hidden_dim,   # 256
-            value_dim=self.args.label_hidden_dim, # 256
-            emb_dim=vt_hidden_size,              # 768
+            query_dim=vt_hidden_size,
+            key_dim=self.args.label_hidden_dim,
+            value_dim=self.args.label_hidden_dim,
+            emb_dim=vt_hidden_size,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.vt_char_attn = MultiAttn(
-            query_dim=vt_hidden_size,             # 768
-            key_dim=self.args.char_hidden_dim,    # 512
-            value_dim=self.args.char_hidden_dim,  # 512
-            emb_dim=vt_hidden_size,              # 768
+            query_dim=vt_hidden_size,
+            key_dim=self.args.char_hidden_dim,
+            value_dim=self.args.char_hidden_dim,
+            emb_dim=vt_hidden_size,
             num_heads=4,
             dropout_rate=0.4
         )
         # Cross Attention (2nd Block)
         self.refine_label_char = MultiAttn(
-            query_dim=self.args.label_hidden_dim,  # 256
-            key_dim=self.args.char_hidden_dim,    # 512
-            value_dim=self.args.char_hidden_dim,  # 512
-            emb_dim=self.args.label_hidden_dim,   # 256
+            query_dim=self.args.label_hidden_dim,
+            key_dim=self.args.char_hidden_dim,
+            value_dim=self.args.char_hidden_dim,
+            emb_dim=self.args.label_hidden_dim,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.refine_vt_char_label = MultiAttn(
-            query_dim=vt_hidden_size,             # 768
-            key_dim=self.args.char_hidden_dim,    # 512
-            value_dim=self.args.char_hidden_dim,  # 512
-            emb_dim=vt_hidden_size,              # 768
+            query_dim=vt_hidden_size,
+            key_dim=self.args.char_hidden_dim,
+            value_dim=self.args.char_hidden_dim,
+            emb_dim=vt_hidden_size,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.refine_char_label = MultiAttn(
-            query_dim=self.args.char_hidden_dim,   # 512
-            key_dim=self.args.label_hidden_dim,   # 256
-            value_dim=self.args.label_hidden_dim, # 256
-            emb_dim=self.args.char_hidden_dim,    # 512
+            query_dim=self.args.char_hidden_dim,
+            key_dim=self.args.label_hidden_dim,
+            value_dim=self.args.label_hidden_dim,
+            emb_dim=self.args.char_hidden_dim,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.refine_label_char_context = MultiAttn(
-            query_dim=self.args.label_hidden_dim,  # 256
-            key_dim=self.args.char_hidden_dim,    # 512
-            value_dim=self.args.char_hidden_dim,  # 512
-            emb_dim=self.args.label_hidden_dim,   # 256
+            query_dim=self.args.label_hidden_dim,
+            key_dim=self.args.char_hidden_dim,
+            value_dim=self.args.char_hidden_dim,
+            emb_dim=self.args.label_hidden_dim,
             num_heads=4,
             dropout_rate=0.4
         )
         self.refine_char_vt = MultiAttn(
-            query_dim=self.args.char_hidden_dim,  # 512
-            key_dim=vt_hidden_size,              # 768
-            value_dim=vt_hidden_size,            # 768
-            emb_dim=self.args.char_hidden_dim,   # 512
+            query_dim=self.args.char_hidden_dim,
+            key_dim=vt_hidden_size,
+            value_dim=vt_hidden_size,
+            emb_dim=self.args.char_hidden_dim,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.refine_vt_char = MultiAttn(
-            query_dim=vt_hidden_size,             # 768
-            key_dim=self.args.char_hidden_dim,    # 512
-            value_dim=self.args.char_hidden_dim,  # 512
-            emb_dim=vt_hidden_size,              # 768
+            query_dim=vt_hidden_size,
+            key_dim=self.args.char_hidden_dim,
+            value_dim=self.args.char_hidden_dim,
+            emb_dim=vt_hidden_size,
             num_heads=4,
             dropout_rate=0.4
         )
@@ -200,96 +200,62 @@ class DiffusionModel(nn.Module):
         self.noise_pred = nn.Linear(self.vt_hidden_size + self.args.label_hidden_dim, self.args.label_hidden_dim)
         self.dropout = nn.Dropout(0.5)
         self.crf = CRF(num_labels, batch_first=True)
-        
-    def forward(self, labels=None, targets_new=None, char_input_ids=None, input_ids=None, attention_mask=None, 
-                token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None, mode='pretrain', epoch=0):
-        self.current_epoch = epoch
-        bsz = input_ids.size(0) if input_ids is not None else labels.size(0)
-        assert attention_mask.max() <= 1 and attention_mask.min() >= 0, "Invalid attention_mask"
 
-        if self.ner_model_name == "hvpnet":
-            ner_loss, ner_logits, ner_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
-                                                            labels, images, aux_imgs)
-        elif self.ner_model_name == "mkgformer":
-            ner_loss, ner_logits, ner_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
-                                                            labels, images, aux_imgs, rcnn_imgs)
-        else:
-            raise ValueError("Invalid ner_model_name")
-        ner_loss = ner_loss if ner_loss is not None else torch.tensor(0.0, device=self.args.device)
-
-        if self.ner_model_name == "hvpnet":
-            sequence_output = self.vt_encoder(input_ids, attention_mask, token_type_ids, images, aux_imgs)
-        elif self.ner_model_name == "mkgformer":
-            sequence_output = self.vt_encoder(input_ids, attention_mask, token_type_ids, images, aux_imgs).last_hidden_state
-        else:
-            raise ValueError("Invalid ner_model_name")
-        ner_emissions = self.ner_model.fc(sequence_output)
-
-        if labels is None:
-            return None, None, ner_logits
-        
-        t = torch.randint(0, self.args.train_steps, (bsz,), device=self.args.device)
-        corrupt_label_embeddings, noise = self.corrupt(t, labels, attention_mask)
-        recon_emissions, predicted_noise = self.denoise(
-            corrupt_label_embeddings, t, char_input_ids, input_ids, attention_mask, 
-            token_type_ids, images, aux_imgs, rcnn_imgs, targets_new=targets_new if mode in ['finetune_forward', 'finetune_backward'] else None
+    def get_label_embedding(self, labels, attention_mask=None, is_targets_new=False):
+        # Embed labels using the label embedding table and process through MLP, positional encoding, and self-attention
+        assert labels is not None, "labels required"
+        assert labels.max() < self.label_embedding_table.shape[0], "Label indices out of range"
+        label_features = self.label_embedding_table[labels]
+        label_features = self.label_mlp(label_features)
+        label_features = self.label_pos_encoder(label_features)
+        label_mask = 1 - attention_mask if attention_mask is not None else None
+        label_features = self.label_self_attn(
+            query=label_features, key=label_features, value=label_features, mask=label_mask
         )
-        
-        mse_loss = F.mse_loss(predicted_noise, noise)
-        if mode in ['finetune_forward', 'finetune_backward'] and targets_new is not None:
-            error_mask = (targets_new != labels).float()
-            denoise_crf_loss = -self.crf(recon_emissions, targets_new, mask=attention_mask.bool(), reduction='none')
-            denoise_crf_loss = (denoise_crf_loss * (1.0 + 4.0 * error_mask)).mean()
-            loss = 1.0 * denoise_crf_loss + 0.3 * mse_loss
+        return label_features
+
+    def get_context_embedding(self, char_input_ids=None, input_ids=None, attention_mask=None, token_type_ids=None, 
+                             images=None, aux_imgs=None, rcnn_imgs=None):
+        # Extract character-level and visual-textual context embeddings
+        bsz = input_ids.size(0)
+        if char_input_ids is not None:
+            vocab_size = len(self.char_lstm.char2int)
+            assert char_input_ids.shape[1:] == (self.args.max_seq_len, self.args.max_char_len), "Char input shape mismatch"
+            char_input = F.one_hot(char_input_ids, vocab_size).view(-1, self.args.max_char_len, vocab_size).to(torch.float32)
+            hc = self.char_lstm.init_hidden((char_input.shape[0],))
+            hc = tuple([each.to(self.args.device) for each in hc])
+            _, char_hidden = self.char_lstm(char_input, hc)
+            char_features = char_hidden[0].transpose(0, 2).contiguous().view(bsz, self.args.max_seq_len, -1)
+            char_features = self.char_lstm_mlp(char_features)
+            char_features = self.char_pos_encoder(char_features)
+            attn_mask = 1 - attention_mask if attention_mask is not None else None
+            char_features = self.char_self_attn(char_features, char_features, char_features, mask=attn_mask)
         else:
-            pseudo_labels = ner_emissions.argmax(dim=-1).detach() if self.use_pseudo_labels else labels
-            denoise_crf_loss = -self.crf(recon_emissions, pseudo_labels, mask=attention_mask.bool(), reduction='mean')
-            recon_probs = F.softmax(recon_emissions, dim=-1)
-            kl_loss = F.kl_div(recon_probs.log(), ner_probs, reduction='batchmean') if self.use_pseudo_labels else 0.0
-            loss = 0.8 * ner_loss + 0.5 * mse_loss + 0.1 * denoise_crf_loss + 0.1 * kl_loss
-        
-        self.ner_loss = ner_loss
-        self.mse_loss = mse_loss
-        self.denoise_crf_loss = denoise_crf_loss
-        self.kl_loss = torch.tensor(0.0, device=self.args.device) if mode in ['finetune_forward', 'finetune_backward'] else kl_loss
-        
-        return loss, recon_emissions, ner_logits
-    
-    def reverse_diffusion(self, char_input_ids, input_ids, attention_mask, token_type_ids, 
-                         images, aux_imgs, rcnn_imgs, steps=100):
-        batch_size, seq_len = input_ids.shape
-        label_embeddings = torch.randn(batch_size, seq_len, self.args.label_hidden_dim, device=self.args.device)
-        
-        for t in range(steps - 1, -1, -1):
-            t_tensor = torch.full((batch_size,), t, device=self.args.device, dtype=torch.long)
-            _, predicted_noise, _ = self.denoise(
-                label_embeddings, t_tensor, char_input_ids, input_ids, attention_mask,
-                token_type_ids, images, aux_imgs, rcnn_imgs, return_features=True
-            )
-            alpha_bar_t = self.noise_scheduler.alpha_bar[t].view(-1, 1, 1)
-            alpha_t = self.noise_scheduler.alpha[t].view(-1, 1, 1)
-            sigma_t = torch.sqrt(1 - alpha_bar_t) * torch.sqrt(1 - alpha_t) / torch.sqrt(alpha_bar_t)
-            coeff = (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)
-            label_embeddings = (label_embeddings - coeff * predicted_noise) / torch.sqrt(alpha_t)
-            if t > 0:
-                z = torch.randn_like(label_embeddings)
-                label_embeddings += sigma_t * z
-        
-        recon_emissions, _, _ = self.denoise(
-            label_embeddings, torch.zeros(batch_size, device=self.args.device, dtype=torch.long),
-            char_input_ids, input_ids, attention_mask, token_type_ids, images, aux_imgs, rcnn_imgs,
-            return_features=True
-        )
-        diffusion_logits = recon_emissions.argmax(dim=-1)
-        return diffusion_logits
-    
-    def corrupt(self, t, labels=None, attention_mask=None):
+            char_features = None
+        if self.ner_model_name == "hvpnet":
+            vt_features = self.vt_encoder(input_ids, attention_mask, token_type_ids, images, aux_imgs)
+        elif self.ner_model_name == "mkgformer":
+            out = self.vt_encoder(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, 
+                                  pixel_values=images, aux_values=aux_imgs, rcnn_values=rcnn_imgs, return_dict=True)
+            vt_features = out.last_hidden_state
+        assert vt_features.shape == (bsz, self.args.max_seq_len, self.vt_hidden_size), "VT output shape mismatch"
+        return char_features, vt_features
+
+    def corrupt(self, t, labels=None, attention_mask=None, targets_new=None, mode='pretrain'):
+        # Corrupt label embeddings with noise, blending targets_new in fine-tuning for adapter-like conditioning
         label_features = self.get_label_embedding(labels, attention_mask)
-        corrupt_label_embeddings, noise = self.noise_scheduler.add_noise(label_features, t, attention_mask)
+        if mode in ['finetune_forward', 'finetune_backward'] and targets_new is not None:
+            new_label_features = self.get_label_embedding(targets_new, attention_mask)
+            # Blend targets_old (labels) and targets_new to emphasize corrections
+            blended_features = 0.3 * label_features + 0.7 * new_label_features
+            corrupt_label_embeddings, noise = self.noise_scheduler.add_noise(blended_features, t, attention_mask)
+        else:
+            corrupt_label_embeddings, noise = self.noise_scheduler.add_noise(label_features, t, attention_mask)
         return corrupt_label_embeddings, noise
-    
+
     def denoise(self, corrupt_label_embeddings, t, char_input_ids=None, input_ids=None, attention_mask=None, 
                 token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None, targets_new=None, return_features=False):
+        # Denoise corrupted label embeddings using context and optional targets_new conditioning
         t = t.float().view(-1, 1)
         time_features = torch.sin(self.time_mlp(t)).unsqueeze(1)
         char_features, vt_features = self.get_context_embedding(char_input_ids, input_ids, attention_mask, 
@@ -298,10 +264,12 @@ class DiffusionModel(nn.Module):
         # Add time features to condition denoising on timestep t
         corrupt_label_embeddings = corrupt_label_embeddings + time_features
 
-        # Process targets_new for fine-tuning
+        # Process targets_new for fine-tuning (adapter-like injection)
         new_label_features = None
         if targets_new is not None:
             new_label_features = self.get_label_embedding(targets_new, attention_mask)
+            # Inject targets_new into initial embeddings for stronger conditioning
+            corrupt_label_embeddings = corrupt_label_embeddings + 0.5 * self.norm_label_vt(new_label_features)
 
         # First Cross-Attention Block
         char_label_features = self.char_label_attn(
@@ -378,50 +346,124 @@ class DiffusionModel(nn.Module):
         if return_features:
             return recon_emissions, predicted_noise, features
         return recon_emissions, predicted_noise
-    
-    def get_label_embedding(self, labels, attention_mask=None, is_targets_new=False):
-        assert labels is not None, "labels required"
-        assert labels.max() < self.label_embedding_table.shape[0], "Label indices out of range"
-        
-        label_features = self.label_embedding_table[labels]
-        label_features = self.label_mlp(label_features)
-        label_features = self.label_pos_encoder(label_features)
-        label_mask = 1 - attention_mask if attention_mask is not None else None
-        label_features = self.label_self_attn(
-            query=label_features, key=label_features, value=label_features, mask=label_mask
-        )
-        return label_features
-    
-    def get_context_embedding(self, char_input_ids=None, input_ids=None, attention_mask=None, token_type_ids=None, 
-                             images=None, aux_imgs=None, rcnn_imgs=None):
-        bsz = input_ids.size(0)
-        
-        if char_input_ids is not None:
-            vocab_size = len(self.char_lstm.char2int)
-            assert char_input_ids.shape[1:] == (self.args.max_seq_len, self.args.max_char_len), "Char input shape mismatch"
-            char_input = F.one_hot(char_input_ids, vocab_size).view(-1, self.args.max_char_len, vocab_size).to(torch.float32)
-            hc = self.char_lstm.init_hidden((char_input.shape[0],))
-            hc = tuple([each.to(self.args.device) for each in hc])
-            _, char_hidden = self.char_lstm(char_input, hc)
-            char_features = char_hidden[0].transpose(0, 2).contiguous().view(bsz, self.args.max_seq_len, -1)
-            char_features = self.char_lstm_mlp(char_features)
-            char_features = self.char_pos_encoder(char_features)
-            attn_mask = 1 - attention_mask if attention_mask is not None else None
-            char_features = self.char_self_attn(char_features, char_features, char_features, mask=attn_mask)
-        else:
-            char_features = None
 
+    def forward(self, labels=None, targets_new=None, char_input_ids=None, input_ids=None, attention_mask=None, 
+                token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None, mode='pretrain', epoch=0, error_loss_weight=1.0):
+        # Forward pass for training the diffusion model
+        self.current_epoch = epoch
+        bsz = input_ids.size(0) if input_ids is not None else labels.size(0)
+        assert attention_mask is None or (attention_mask.max() <= 1 and attention_mask.min() >= 0), "Invalid attention_mask"
+
+        # NER model
+        ner_loss, ner_logits, ner_probs = torch.tensor(0.0, device=self.args.device), None, None
+        sequence_output = None
+        # Use targets_new for ner_loss in fine-tuning to align with error correction
+        ner_labels = targets_new if mode in ['finetune_forward', 'finetune_backward'] else labels
+        if input_ids is not None:
+            if self.ner_model_name == "hvpnet":
+                ner_loss, ner_logits, ner_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
+                                                                ner_labels, images, aux_imgs)
+                sequence_output = self.vt_encoder(input_ids, attention_mask, token_type_ids, images, aux_imgs)
+            elif self.ner_model_name == "mkgformer":
+                ner_loss, ner_logits, ner_probs = self.ner_model(input_ids, attention_mask, token_type_ids, 
+                                                                ner_labels, images, aux_imgs, rcnn_imgs)
+                sequence_output = self.vt_encoder(input_ids, attention_mask, token_type_ids, images, aux_imgs).last_hidden_state
+            ner_emissions = self.ner_model.fc(sequence_output)
+
+        if labels is None:
+            return None, None, ner_logits
+
+        # Corrupt labels and denoise
+        t = torch.randint(0, self.args.train_steps, (bsz,), device=self.args.device)
+        corrupt_label_embeddings, noise = self.corrupt(t, labels, attention_mask, targets_new=targets_new, mode=mode)
+        recon_emissions, predicted_noise = self.denoise(
+            corrupt_label_embeddings, t, char_input_ids, input_ids, attention_mask, 
+            token_type_ids, images, aux_imgs, rcnn_imgs, targets_new=targets_new if mode in ['finetune_forward', 'finetune_backward'] else None
+        )
+
+        # MSE loss for noise prediction
+        if mode in ['finetune_forward', 'finetune_backward']:
+            new_label_features = self.get_label_embedding(targets_new, attention_mask)
+            signal_rate_t = self.noise_scheduler.alpha_bar[t].sqrt().view(-1, 1, 1)
+            noise_rate_t = (1 - self.noise_scheduler.alpha_bar[t]).sqrt().view(-1, 1, 1)
+            target_noise = (corrupt_label_embeddings - signal_rate_t * new_label_features) / noise_rate_t
+            mse_loss = F.mse_loss(predicted_noise, target_noise)
+        else:
+            mse_loss = F.mse_loss(predicted_noise, noise)
+
+        # CRF loss for label sequence prediction
+        if mode in ['finetune_forward', 'finetune_backward']:
+            error_mask = (targets_new != labels).float()
+            denoise_crf_loss = -self.crf(recon_emissions, targets_new, mask=attention_mask.bool(), reduction='none')
+            denoise_crf_loss = (denoise_crf_loss * (1.0 + 4.0 * error_mask)).mean() * error_loss_weight
+            loss = 0.8 * ner_loss + 2.0 * denoise_crf_loss + 0.3 * mse_loss
+        else:
+            pseudo_labels = ner_emissions.argmax(dim=-1).detach() if self.use_pseudo_labels and ner_emissions is not None else labels
+            denoise_crf_loss = -self.crf(recon_emissions, pseudo_labels, mask=attention_mask.bool(), reduction='mean')
+            recon_probs = F.softmax(recon_emissions, dim=-1)
+            kl_loss = F.kl_div(recon_probs.log(), ner_probs, reduction='batchmean') if self.use_pseudo_labels and ner_probs is not None else 0.0
+            loss = 0.8 * ner_loss + 0.5 * mse_loss + 0.1 * denoise_crf_loss + 0.1 * kl_loss
+
+        self.ner_loss = ner_loss
+        self.mse_loss = mse_loss
+        self.denoise_crf_loss = denoise_crf_loss
+        self.kl_loss = torch.tensor(0.0, device=self.args.device) if mode in ['finetune_forward', 'finetune_backward'] else kl_loss
+
+        return loss, recon_emissions, ner_logits
+
+    def reverse_diffusion(self, char_input_ids, input_ids, attention_mask, token_type_ids, 
+                         images, aux_imgs, rcnn_imgs, steps=100, guidance_scale=2.0):
+        # Perform reverse diffusion to generate label sequences using classifier-free guidance
+        batch_size, seq_len = input_ids.shape
+        label_embeddings = torch.randn(batch_size, seq_len, self.args.label_hidden_dim, device=self.args.device)
+
+        # Compute proxy targets_new for conditional prediction
         if self.ner_model_name == "hvpnet":
-            vt_features = self.vt_encoder(input_ids, attention_mask, token_type_ids, images, aux_imgs)
+            _, ner_logits, _ = self.ner_model(input_ids, attention_mask, token_type_ids, None, images, aux_imgs)
         elif self.ner_model_name == "mkgformer":
-            out = self.vt_encoder(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, 
-                                  pixel_values=images, aux_values=aux_imgs, rcnn_values=rcnn_imgs, return_dict=True)
-            vt_features = out.last_hidden_state
-        assert vt_features.shape == (bsz, self.args.max_seq_len, self.vt_hidden_size), "VT output shape mismatch"
-        
-        return char_features, vt_features
-    
+            _, ner_logits, _ = self.ner_model(input_ids, attention_mask, token_type_ids, None, images, aux_imgs, rcnn_imgs)
+        # Convert CRF-decoded sequences (list of lists) to tensor
+        proxy_targets_new = torch.tensor(ner_logits, dtype=torch.long, device=self.args.device)
+
+        # Iterative denoising loop
+        for t in range(steps - 1, -1, -1):
+            t_tensor = torch.full((batch_size,), t, device=self.args.device, dtype=torch.long)
+            # Conditional prediction with proxy targets_new
+            _, predicted_noise_cond, _ = self.denoise(
+                label_embeddings, t_tensor, char_input_ids, input_ids, attention_mask,
+                token_type_ids, images, aux_imgs, rcnn_imgs, targets_new=proxy_targets_new,
+                return_features=True
+            )
+            # Unconditional prediction (relies on pretrained weights)
+            _, predicted_noise_uncond, _ = self.denoise(
+                label_embeddings, t_tensor, char_input_ids, input_ids, attention_mask,
+                token_type_ids, images, aux_imgs, rcnn_imgs, targets_new=None,
+                return_features=True
+            )
+            # Classifier-free guidance
+            predicted_noise = predicted_noise_uncond + guidance_scale * (predicted_noise_cond - predicted_noise_uncond)
+
+            # Update embeddings using noise scheduler
+            alpha_bar_t = self.noise_scheduler.alpha_bar[t].view(-1, 1, 1)
+            alpha_t = self.noise_scheduler.alpha[t].view(-1, 1, 1)
+            sigma_t = torch.sqrt(1 - alpha_bar_t) * torch.sqrt(1 - alpha_t) / torch.sqrt(alpha_bar_t)
+            coeff = (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t)
+            label_embeddings = (label_embeddings - coeff * predicted_noise) / torch.sqrt(alpha_t)
+            if t > 0:
+                z = torch.randn_like(label_embeddings)
+                label_embeddings += sigma_t * z
+
+        # Final denoising step
+        recon_emissions, _, _ = self.denoise(
+            label_embeddings, torch.zeros(batch_size, device=self.args.device, dtype=torch.long),
+            char_input_ids, input_ids, attention_mask, token_type_ids, images, aux_imgs, rcnn_imgs,
+            targets_new=proxy_targets_new, return_features=True
+        )
+        diffusion_logits = recon_emissions.argmax(dim=-1)
+        return diffusion_logits
+
     def update_pseudo_label_state(self, ner_f1):
+        # Update pseudo-label usage based on NER F1 score
         self.current_ner_f1 = ner_f1
         if ner_f1 >= self.pseudo_label_f1_threshold:
             self.use_pseudo_labels = True
