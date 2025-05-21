@@ -61,24 +61,26 @@ CLSTM_PATH = {
     'twitter17': 'char_lstm/twitter2017'
 }
 
+# Set random seed for reproducibility
 def set_seed(seed):
-    """Set random seed for reproducibility."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     np.random.seed(seed)
     random.seed(seed)
 
+# Main function to orchestrate training, fine-tuning, or prediction
 def main():
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Main script for NER pretraining, fine-tuning, NER baseline, or prediction with mutually exclusive modes.")
+    parser = argparse.ArgumentParser(description="Main script for NER/diffusion pretraining, fine-tuning, or prediction with mutually exclusive modes.")
     parser.add_argument("--dataset_name", default="twitter15", type=str, choices=['twitter15', 'twitter17'], help="The name of dataset.")
     parser.add_argument("--ner_model_name", default="hvpnet", type=str, help="The name of supporting NER model (hvpnet or mkgformer).")
     parser.add_argument('--vit_name', default='openai/clip-vit-base-patch32', type=str, help="The name of vision transformer.")
-    parser.add_argument('--num_epochs', default=15, type=int, help="Number of training epochs.")  # Reduced to 15
+    parser.add_argument('--num_epochs', default=15, type=int, help="Number of training epochs.")
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="Device: cuda or cpu.")
     parser.add_argument('--batch_size', default=32, type=int, help="Batch size.")
     parser.add_argument('--lr', default=2e-5, type=float, help="Learning rate.")
+    parser.add_argument('--finetune_lr', default=5e-6, type=float, help="Learning rate for fine-tuning.")
     parser.add_argument('--warmup_ratio', default=0.01, type=float, help="Warmup ratio for learning rate scheduler.")
     parser.add_argument('--eval_begin_epoch', default=3, type=int, help="Epoch to start evaluation.")
     parser.add_argument('--seed', default=2021, type=int, help="Random seed.")
@@ -90,13 +92,14 @@ def main():
     parser.add_argument('--prompt_len', default=10, type=int, help="Prompt length.")
     parser.add_argument('--prompt_dim', default=800, type=int, help="Mid dimension of prompt project layer.")
     parser.add_argument('--noise_dim', default=128, type=int, help="Dimensions of noises.")
-    parser.add_argument('--load_path', default=None, type=str, help="Path to load model for fine-tuning or NER training (non-predict modes).")
+    parser.add_argument('--load_path', default=None, type=str, help="Path to load model for fine-tuning or NER training.")
     parser.add_argument('--save_path', default="./models", type=str, help="Path to save model.")
     parser.add_argument('--notes', default="", type=str, help="Remarks for save path directory.")
-    parser.add_argument("--do_ner_train", action="store_true", help="Run NER training on unlabeled dataset as baseline.")
-    parser.add_argument('--do_pretrain', action='store_true', help="Run pre-training on unlabeled dataset.")
-    parser.add_argument('--do_fine_tune', action='store_true', help="Run fine-tuning on labeled dataset.")
-    parser.add_argument('--predict', action='store_true', help="Run prediction with 70/15/15 cross-validation, pretraining and fine-tuning from scratch per round.")
+    parser.add_argument("--do_ner_pretrain", action="store_true", help="Run NER pretraining on unlabeled dataset.")
+    parser.add_argument("--do_ner_fine_tune", action="store_true", help="Run NER fine-tuning on labeled dataset.")
+    parser.add_argument('--do_diffusion_pretrain', action='store_true', help="Run diffusion pretraining on unlabeled dataset.")
+    parser.add_argument('--do_diffusion_fine_tune', action='store_true', help="Run diffusion fine-tuning on labeled dataset.")
+    parser.add_argument('--predict', action='store_true', help="Run prediction with 70/15/15 cross-validation.")
     parser.add_argument("--max_seq_len", default=128, type=int, help="Maximum sequence length.")
     parser.add_argument("--max_char_len", default=128, type=int, help="Maximum character length.")
     parser.add_argument('--use_prompt', action='store_true', help="Use visual prompts (images) for hvpnet/mkgformer.")
@@ -111,15 +114,16 @@ def main():
     parser.add_argument('--lambda_edit', default=1.0, type=float, help="Edit loss weight.")
     parser.add_argument('--lambda_cycle', default=1.0, type=float, help="Cycle loss weight.")
     parser.add_argument('--lambda_contrast', default=1.0, type=float, help="Contrastive loss weight.")
+    parser.add_argument('--noise_rate', default=0.3, type=float, help="Synthetic noise rate for low error rate.")
 
     args = parser.parse_args()
 
-    # Validate mutually exclusive arguments
-    modes = [args.predict, args.do_pretrain, args.do_fine_tune, args.do_ner_train]
+    # Validate that exactly one mode is selected
+    modes = [args.predict, args.do_ner_pretrain, args.do_ner_fine_tune, args.do_diffusion_pretrain, args.do_diffusion_fine_tune]
     if sum(modes) != 1:
-        raise ValueError("Exactly one of --predict, --do_pretrain, --do_fine_tune, or --do_ner_train must be set.")
+        raise ValueError("Exactly one of --predict, --do_ner_pretrain, --do_ner_fine_tune, --do_diffusion_pretrain, or --do_diffusion_fine_tune must be set.")
 
-    # Validate other arguments
+    # Validate dataset and arguments
     if args.dataset_name not in DATA_PATH:
         raise ValueError(f"Dataset {args.dataset_name} not supported.")
     if args.num_epochs < 1:
@@ -129,7 +133,7 @@ def main():
     if args.load_path and not os.path.exists(args.load_path):
         raise ValueError(f"Load path {args.load_path} does not exist.")
 
-    # Set image paths based on use_prompt
+    # Configure image paths if prompts are used
     if args.use_prompt:
         imgs_path = IMG_PATH[args.dataset_name]
         aux_imgs_path = AUX_PATH[args.dataset_name]
@@ -142,7 +146,7 @@ def main():
     data_path = DATA_PATH[args.dataset_name]
     clstm_path = CLSTM_PATH[args.dataset_name]
 
-    # Initialize transform for hvpnet (used only when use_prompt=True)
+    # Define image transformations if prompts are used
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
@@ -151,13 +155,11 @@ def main():
 
     # Set random seed
     set_seed(args.seed)
-
-    # Create directories for saving models and logs
     os.makedirs(args.save_path, exist_ok=True)
     logdir = os.path.join("logs", f"{args.dataset_name}_bs{args.batch_size}_lr{args.lr}{args.notes}")
     os.makedirs(logdir, exist_ok=True)
 
-    # Initialize processor
+    # Initialize LEDProcessor for data processing
     logger.info("Initializing LEDProcessor...")
     processor = LEDProcessor(data_path, clstm_path, args)
     label_mapping = processor.get_label_mapping()
@@ -165,12 +167,11 @@ def main():
     num_labels = len(label_mapping)
     logger.info(f"Loaded {num_labels} labels from processor.")
 
-    # Initialize datasets
     unlabeled_dataset = None
     labeled_dataset = None
 
-    # Load datasets based on mode
-    if args.do_pretrain or args.do_ner_train or args.predict:
+    # Load unlabeled dataset for pretraining or prediction
+    if args.do_ner_pretrain or args.do_diffusion_pretrain or args.predict:
         logger.info("Loading unlabeled dataset...")
         unlabeled_dataset = LEDDataset(
             processor=processor,
@@ -188,8 +189,9 @@ def main():
             raise ValueError("Unlabeled dataset is empty.")
         logger.info(f"Unlabeled dataset size: {len(unlabeled_dataset)}")
 
-    if args.do_fine_tune or args.predict:
-        logger.info("Loading labeled dataset for fine-tuning...")
+    # Load labeled dataset for fine-tuning or prediction
+    if args.do_ner_fine_tune or args.do_diffusion_fine_tune or args.predict:
+        logger.info("Loading labeled dataset...")
         labeled_dataset = LEDDataset(
             processor=processor,
             transform=transform,
@@ -206,7 +208,7 @@ def main():
             raise ValueError("Labeled dataset is empty; cannot proceed with fine-tuning.")
         logger.info(f"Labeled dataset size: {len(labeled_dataset)}")
 
-    # Split labeled dataset for fine-tuning (70/15/15 train/val/test)
+    # Split labeled dataset into train/val/test (70/15/15)
     train_dataloader_labeled = None
     val_dataloader_labeled = None
     test_dataloader_labeled = None
@@ -226,25 +228,24 @@ def main():
         test_dataloader_labeled = DataLoader(
             test_dataset_labeled, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True
         )
-        logger.info(f"Labeled dataset for fine-tuning: train={len(train_dataset_labeled)}, val={len(val_dataset_labeled)}, test={len(test_dataset_labeled)}")
+        logger.info(f"Labeled dataset: train={len(train_dataset_labeled)}, val={len(val_dataset_labeled)}, test={len(test_dataset_labeled)}")
 
-    # Non-predict modes: Pretraining, Fine-tuning, or NER training
+    # Training and fine-tuning logic
     if not args.predict:
-        # Initialize metrics file
         metrics_file = os.path.join(logdir, "metrics.csv")
         with open(metrics_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['epoch', 'task', 'stage', 'loss', 'ner_f1', 'diffusion_f1', 'error_f1'])
         logger.info(f"Logging metrics to {metrics_file}")
 
-        # Split unlabeled dataset for pretraining or NER training (80/10/10 train/val/test)
+        # Split unlabeled dataset into train/val/test (80/10/10)
         train_dataloader_unlabeled = None
         val_dataloader_unlabeled = None
         test_dataloader_unlabeled = None
-        if unlabeled_dataset and (args.do_pretrain or args.do_ner_train):
-            train_size_unlabeled = int(0.8 * len(unlabeled_dataset))  # 80% for training
-            val_size_unlabeled = int(0.1 * len(unlabeled_dataset))    # 10% for validation
-            test_size_unlabeled = len(unlabeled_dataset) - train_size_unlabeled - val_size_unlabeled  # 10% for test
+        if unlabeled_dataset and (args.do_ner_pretrain or args.do_diffusion_pretrain):
+            train_size_unlabeled = int(0.8 * len(unlabeled_dataset))
+            val_size_unlabeled = int(0.1 * len(unlabeled_dataset))
+            test_size_unlabeled = len(unlabeled_dataset) - train_size_unlabeled - val_size_unlabeled
             train_dataset_unlabeled, val_dataset_unlabeled, test_dataset_unlabeled = random_split(
                 unlabeled_dataset, [train_size_unlabeled, val_size_unlabeled, test_size_unlabeled], 
                 generator=torch.Generator().manual_seed(args.seed)
@@ -260,9 +261,9 @@ def main():
             )
             logger.info(f"Unlabeled dataset: train={len(train_dataset_unlabeled)}, val={len(val_dataset_unlabeled)}, test={len(test_dataset_unlabeled)}")
 
-        # Initialize model
+        # Initialize model based on task
         model = None
-        if args.do_pretrain or args.do_fine_tune:
+        if args.do_diffusion_pretrain or args.do_diffusion_fine_tune:
             model = DiffusionModel(
                 args=args,
                 num_labels=num_labels,
@@ -270,7 +271,7 @@ def main():
                 clstm_path=clstm_path,
                 ner_model_name=args.ner_model_name
             ).to(args.device)
-        elif args.do_ner_train:
+        elif args.do_ner_pretrain or args.do_ner_fine_tune:
             if args.ner_model_name == "hvpnet":
                 model = HMNeTNERModel(num_labels=num_labels, args=args).to(args.device)
             elif args.ner_model_name == "mkgformer":
@@ -284,12 +285,12 @@ def main():
             model.load_state_dict(torch.load(args.load_path))
             logger.info("Model loaded successfully.")
 
-        # NER Training (baseline)
-        if args.do_ner_train:
+        # NER Pretraining
+        if args.do_ner_pretrain:
             if not train_dataloader_unlabeled:
-                raise ValueError("Unlabeled dataset not loaded; cannot perform NER training.")
+                raise ValueError("Unlabeled dataset not loaded; cannot perform NER pretraining.")
             if not model:
-                raise ValueError("Model not initialized for NER training.")
+                raise ValueError("Model not initialized for NER pretraining.")
             trainer = NERTrainer(
                 train_data=train_dataloader_unlabeled,
                 val_data=val_dataloader_unlabeled,
@@ -298,21 +299,51 @@ def main():
                 label_map=label_mapping,
                 args=args,
                 logger=logger,
-                metrics_file=os.path.join(args.save_path, f"metrics_ner_{args.ner_model_name}.csv")
+                metrics_file=os.path.join(args.save_path, f"metrics_ner_pretrain_{args.ner_model_name}.csv")
             )
-            logger.info(f"Starting NER training with {args.ner_model_name} as baseline...")
-            trainer.train()
-            logger.info(f"NER training completed: Best val ner_f1={trainer.best_ner_f1:.4f}")
-            # Evaluate on test set
-            test_ner_f1 = trainer.test()
-            logger.info(f"NER training test ner_f1: {test_ner_f1:.4f}")
+            logger.info(f"Starting NER pretraining with {args.ner_model_name}...")
+            trainer.train(task="ner_pretrain")
+            logger.info(f"NER pretraining completed: Best val ner_f1={trainer.best_dev:.4f}")
+            test_ner_f1 = trainer.test(task="ner_pretrain")
+            logger.info(f"NER pretraining test ner_f1: {test_ner_f1:.4f}")
+            ner_pretrain_model_path = os.path.join(args.save_path, "ner_pretrain.pth")
+            torch.save(model.state_dict(), ner_pretrain_model_path)
+            logger.info(f"Saved NER pretrained model to {ner_pretrain_model_path}")
 
-        # Pre-training
-        if args.do_pretrain:
-            if not train_dataloader_unlabeled:
-                raise ValueError("Unlabeled dataset not loaded; cannot perform pretraining.")
+        # NER Fine-tuning
+        if args.do_ner_fine_tune:
+            if not train_dataloader_labeled:
+                raise ValueError("Labeled dataset not loaded; cannot perform NER fine-tuning.")
             if not model:
-                raise ValueError("Model not initialized for pretraining.")
+                raise ValueError("Model not initialized for NER fine-tuning.")
+            if args.load_path or os.path.exists(os.path.join(args.save_path, "ner_pretrain.pth")):
+                load_path = args.load_path or os.path.join(args.save_path, "ner_pretrain.pth")
+                logger.info(f"Loading pretrained NER model from {load_path}")
+                model.load_state_dict(torch.load(load_path))
+            trainer = NERTrainer(
+                train_data=train_dataloader_labeled,
+                val_data=val_dataloader_labeled,
+                test_data=test_dataloader_labeled,
+                model=model,
+                label_map=label_mapping,
+                args=args,
+                logger=logger,
+                metrics_file=os.path.join(args.save_path, f"metrics_ner_finetune_{args.ner_model_name}.csv")
+            )
+            logger.info(f"Starting NER fine-tuning with {args.ner_model_name}...")
+            trainer.train(task="ner_finetune")
+            error_f1 = trainer.test(task="ner_finetune")
+            logger.info(f"NER fine-tuning test Error Detection F1: {error_f1:.4f}")
+            ner_finetune_model_path = os.path.join(args.save_path, "ner_finetune.pth")
+            torch.save(model.state_dict(), ner_finetune_model_path)
+            logger.info(f"Saved NER fine-tuned model to {ner_finetune_model_path}")
+
+        # Diffusion Pretraining
+        if args.do_diffusion_pretrain:
+            if not train_dataloader_unlabeled:
+                raise ValueError("Unlabeled dataset not loaded; cannot perform diffusion pretraining.")
+            if not model:
+                raise ValueError("Model not initialized for diffusion pretraining.")
             trainer = PreTrainer(
                 train_data=train_dataloader_unlabeled,
                 val_data=val_dataloader_unlabeled,
@@ -323,23 +354,21 @@ def main():
                 logger=logger,
                 metrics_file=metrics_file
             )
-            logger.info("Starting pre-training with task='pretrain' on unlabeled dataset...")
-            trainer.train(task="pretrain")
-            logger.info(f"Pre-training completed: Best val ner_f1={trainer.best_ner_f1:.4f}, diffusion_f1={trainer.best_diffusion_f1:.4f}")
-            # Save pretrained model
-            pretrain_model_path = os.path.join(args.save_path, "pretrain.pth")
-            torch.save(model.state_dict(), pretrain_model_path)
-            logger.info(f"Saved pretrained model to {pretrain_model_path}")
-            # Evaluate on test set
-            test_ner_f1, test_diffusion_f1 = trainer.test(task="pretrain")
-            logger.info(f"Pre-training test ner_f1: {test_ner_f1:.4f}, diffusion_f1: {test_diffusion_f1:.4f}")
+            logger.info("Starting diffusion pretraining with task='diffusion_pretrain'...")
+            trainer.train(task="diffusion_pretrain")
+            logger.info(f"Diffusion pretraining completed: Best val ner_f1={trainer.best_ner_f1:.4f}, diffusion_f1={trainer.best_diffusion_f1:.4f}")
+            diffusion_pretrain_model_path = os.path.join(args.save_path, "diffusion_pretrain.pth")
+            torch.save(model.state_dict(), diffusion_pretrain_model_path)
+            logger.info(f"Saved diffusion pretrained model to {diffusion_pretrain_model_path}")
+            test_ner_f1, test_diffusion_f1 = trainer.test(task="diffusion_pretrain")
+            logger.info(f"Diffusion pretraining test ner_f1: {test_ner_f1:.4f}, diffusion_f1: {test_diffusion_f1:.4f}")
 
-        # Fine-tuning
-        if args.do_fine_tune:
+        # Diffusion Fine-tuning
+        if args.do_diffusion_fine_tune:
             if not train_dataloader_labeled:
                 raise ValueError("Labeled dataset not loaded; cannot fine-tune.")
             if not model:
-                raise ValueError("Model not initialized for fine-tuning.")
+                raise ValueError("Model not initialized for diffusion fine-tuning.")
             trainer = PreTrainer(
                 train_data=train_dataloader_labeled,
                 val_data=val_dataloader_labeled,
@@ -350,37 +379,33 @@ def main():
                 logger=logger,
                 metrics_file=metrics_file
             )
-            logger.info("Starting fine-tuning with task='finetune'...")
-            trainer.train(task="finetune")
-            error_f1 = trainer.test(task="finetune")
-            logger.info(f"Fine-tuning test Error Detection F1: {error_f1:.4f}")
-            # Save fine-tuned model
-            finetune_model_path = os.path.join(args.save_path, "finetune.pth")
-            torch.save(model.state_dict(), finetune_model_path)
-            logger.info(f"Saved fine-tuned model to {finetune_model_path}")
+            logger.info("Starting diffusion fine-tuning with task='diffusion_finetune'...")
+            trainer.train(task="diffusion_finetune")
+            error_f1 = trainer.test(task="diffusion_finetune")
+            logger.info(f"Diffusion fine-tuning test Error Detection F1: {error_f1:.4f}")
+            diffusion_finetune_model_path = os.path.join(args.save_path, "diffusion_finetune.pth")
+            torch.save(model.state_dict(), diffusion_finetune_model_path)
+            logger.info(f"Saved diffusion fine-tuned model to {diffusion_finetune_model_path}")
 
-    # Predict mode: Cross-validation with pretraining, fine-tuning, and prediction from scratch
+    # Prediction mode with cross-validation
     else:
-        # Cross-validation setup
-        num_rounds = 5  # Fixed number of rounds
+        num_rounds = 5
         test_error_f1_scores = []
 
-        # Calculate split sizes for 70/15/15
+        # Define split sizes for cross-validation
         total_samples = len(unlabeled_dataset)
-        train_size = int(0.7 * total_samples)  # 70% for training
-        val_size = int(0.15 * total_samples)   # 15% for validation
-        test_size = total_samples - train_size - val_size  # 15% for test
+        train_size = int(0.7 * total_samples)
+        val_size = int(0.15 * total_samples)
+        test_size = total_samples - train_size - val_size
         logger.info(f"Prediction cross-validation split sizes: train={train_size}, val={val_size}, test={test_size}")
 
-        # Shuffle indices for random splits
         indices = list(range(total_samples))
-        random.shuffle(indices, random=lambda: 0.5)  # Deterministic shuffle with seed
+        random.shuffle(indices, random=lambda: 0.5)
 
-        # Prediction loop
+        # Perform cross-validation rounds
         for round_idx in range(num_rounds):
             logger.info(f"Starting prediction round {round_idx + 1}/{num_rounds}")
 
-            # Prepare round-specific directories and metrics file
             round_save_path = os.path.join(args.save_path, f"round_{round_idx}")
             os.makedirs(round_save_path, exist_ok=True)
             round_metrics_file = os.path.join(logdir, f"metrics_round_{round_idx}.csv")
@@ -389,7 +414,7 @@ def main():
                 writer.writerow(['epoch', 'task', 'stage', 'loss', 'ner_f1', 'diffusion_f1', 'error_f1'])
             logger.info(f"Logging metrics for round {round_idx + 1} to {round_metrics_file}")
 
-            # Define indices for train, val, test sets
+            # Define indices for train/val/test splits
             test_start = round_idx * test_size
             test_end = min(test_start + test_size, total_samples)
             test_indices = indices[test_start:test_end]
@@ -403,7 +428,7 @@ def main():
             train_indices = [i for i in indices if i not in test_indices and i not in val_indices]
             train_indices = train_indices[:train_size]
 
-            # Create datasets
+            # Create datasets for the round
             train_dataset_unlabeled = torch.utils.data.Subset(unlabeled_dataset, train_indices)
             val_dataset_unlabeled = torch.utils.data.Subset(unlabeled_dataset, val_indices)
             test_dataset_unlabeled = torch.utils.data.Subset(unlabeled_dataset, test_indices)
@@ -419,7 +444,7 @@ def main():
             )
             logger.info(f"Round {round_idx + 1} dataset: train={len(train_dataset_unlabeled)}, val={len(val_dataset_unlabeled)}, test={len(test_dataset_unlabeled)}")
 
-            # Initialize fresh model for this round
+            # Initialize diffusion model
             model = DiffusionModel(
                 args=args,
                 num_labels=num_labels,
@@ -428,7 +453,7 @@ def main():
                 ner_model_name=args.ner_model_name
             ).to(args.device)
 
-            # Pre-training
+            # Train and evaluate for the round
             trainer = PreTrainer(
                 train_data=train_dataloader_unlabeled,
                 val_data=val_dataloader_unlabeled,
@@ -439,87 +464,12 @@ def main():
                 logger=logger,
                 metrics_file=round_metrics_file
             )
-            logger.info(f"Round {round_idx + 1}: Starting pre-training with task='pretrain'...")
-            trainer.train(task="pretrain")
-            logger.info(f"Round {round_idx + 1}: Pre-training completed: Best val ner_f1={trainer.best_ner_f1:.4f}, diffusion_f1={trainer.best_diffusion_f1:.4f}")
-            # Save pretrained model
-            pretrain_model_path = os.path.join(round_save_path, f"pretrain_round_{round_idx}.pth")
+            logger.info(f"Round {round_idx + 1}: Starting diffusion pretraining with task='diffusion_pretrain'...")
+            trainer.train(task="diffusion_pretrain")
+            logger.info(f"Round {round_idx + 1}: Diffusion pretraining completed: Best val ner_f1={trainer.best_ner_f1:.4f}, diffusion_f1={trainer.best_diffusion_f1:.4f}")
+            pretrain_model_path = os.path.join(round_save_path, f"diffusion_pretrain_round_{round_idx}.pth")
             torch.save(model.state_dict(), pretrain_model_path)
-            logger.info(f"Round {round_idx + 1}: Saved pretrained model to {pretrain_model_path}")
-
-            # Fine-tuning
-            trainer = PreTrainer(
-                train_data=train_dataloader_labeled,
-                val_data=val_dataloader_labeled,
-                test_data=test_dataloader_labeled,
-                model=model,
-                label_map=label_mapping,
-                args=args,
-                logger=logger,
-                metrics_file=round_metrics_file
-            )
-            logger.info(f"Round {round_idx + 1}: Starting fine-tuning with task='finetune'...")
-            trainer.train(task="finetune")
-            error_f1 = trainer.test(task="finetune")
-            logger.info(f"Round {round_idx + 1}: Fine-tuning test Error Detection F1: {error_f1:.4f}")
-            # Save fine-tuned model
-            finetune_model_path = os.path.join(round_save_path, f"finetune_round_{round_idx}.pth")
-            torch.save(model.state_dict(), finetune_model_path)
-            logger.info(f"Round {round_idx + 1}: Saved fine-tuned model to {finetune_model_path}")
-
-            # Prediction
-            trainer = PreTrainer(
-                train_data=None,
-                val_data=None,
-                test_data=test_dataloader_unlabeled,
-                model=model,
-                label_map=label_mapping,
-                args=args,
-                logger=logger,
-                metrics_file=round_metrics_file
-            )
-            logger.info(f"Round {round_idx + 1}: Generating predictions with task='finetune'...")
-            predictions = []
-            with torch.no_grad():
-                for batch in test_dataloader_unlabeled:
-                    batch = [tup.to(args.device) if isinstance(tup, torch.Tensor) else tup for tup in batch]
-                    loss, ner_logits, diffusion_logits, targets_batch, attention_mask, words, img_names = trainer._step(
-                        batch, task="finetune", stage="test", epoch=0
-                    )
-                    targets_unk = targets_batch[0] if isinstance(targets_batch, tuple) else targets_batch
-                    # Get predicted and noisy labels as indices
-                    noisy_labels, pred_labels = trainer._gen_labels(diffusion_logits, targets_unk, attention_mask, return_indices=True)
-                    for i in range(len(words)):
-                        predictions.append((img_names[i], words[i], pred_labels[i], noisy_labels[i]))
-
-            # Save predictions to CSV
-            output_file = os.path.join(round_save_path, f"predictions_round_{round_idx}.csv")
-            label_map = {idx: label for label, idx in label_mapping.items()}
-            with open(output_file, 'w', encoding='utf-8', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['img_name', 'word', 'pred_label', 'noisy_label'])
-                for img_name, word_list, pred_label_list, noisy_label_list in predictions:
-                    for word, pred_label, noisy_label in zip(word_list, pred_label_list, noisy_label_list):
-                        if word not in ['[CLS]', '[SEP]', '[PAD]'] and pred_label != label_mapping.get('[PAD]', 0):
-                            writer.writerow([
-                                img_name,
-                                word,
-                                label_map.get(pred_label, 'O'),
-                                label_map.get(noisy_label, 'O')
-                            ])
-            logger.info(f"Round {round_idx + 1}: Predictions saved to {output_file}")
-
-            # Store error_f1 for summary
-            test_error_f1_scores.append(error_f1)
-
-        # Log average test error F1 across rounds
-        if test_error_f1_scores:
-            avg_error_f1 = np.mean(test_error_f1_scores)
-            logger.info(f"Average Error Detection F1 across {len(test_error_f1_scores)} rounds: {avg_error_f1:.4f}")
-            with open(os.path.join(logdir, "summary.csv"), 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['metric', 'value'])
-                writer.writerow(['avg_error_f1', avg_error_f1])
+            logger.info(f"Saved diffusion pretrained model for round {round_idx + 1} to {pretrain_model_path}")
 
 if __name__ == "__main__":
     main()
