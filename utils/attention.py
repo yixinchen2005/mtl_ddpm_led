@@ -7,17 +7,19 @@ import torch.nn.functional as F
 class MultiAttn(nn.Module):
     def __init__(self, query_dim, key_dim, value_dim, emb_dim, num_heads, dropout_rate):
         super().__init__()
-        self.W_q = Linear(query_dim, emb_dim)
-        self.W_k = Linear(key_dim, emb_dim)
-        self.W_v = Linear(value_dim, emb_dim)
-        self.multihead_attn = MultiheadAttention(emb_dim, num_heads, dropout=dropout_rate, batch_first=True)
-        self.norm = LayerNorm(emb_dim)
+        self.W_q = nn.Linear(query_dim, emb_dim)
+        self.W_k = nn.Linear(key_dim, emb_dim)
+        self.W_v = nn.Linear(value_dim, emb_dim)
+        self.multihead_attn = nn.MultiheadAttention(emb_dim, num_heads, dropout=dropout_rate, batch_first=True)
+        self.norm = nn.LayerNorm(emb_dim)
         
     def forward(self, query, key, value, mask):
+        if mask is not None and not mask.dtype == torch.bool:
+            mask = mask.bool()
         q = self.W_q(query)
         k = self.W_k(key)
         v = self.W_v(value)
-        attn_output, _ = self.multihead_attn(q, k, v, key_padding_mask=mask.bool(), need_weights=False)
+        attn_output, _ = self.multihead_attn(q, k, v, key_padding_mask=mask, need_weights=False)
         return self.norm(v + attn_output)
     
 class PositionalEncoding(nn.Module):

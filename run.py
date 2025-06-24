@@ -158,7 +158,7 @@ def main():
 
     # Initialize LEDProcessor
     logger.info("Initializing LEDProcessor...")
-    processor = LEDProcessor(data_path, clstm_path, args)
+    processor = LEDProcessor(args, data_path=data_path, clstm_path=clstm_path)
     label_mapping = processor.get_label_mapping()
     label_embeddings = processor.get_label_embedding().to(args.device)
     num_labels = len(label_mapping)
