@@ -6,7 +6,6 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from transformers.optimization import get_linear_schedule_with_warmup
 from seqeval.metrics import classification_report
-from sklearn.metrics import precision_score, recall_score, f1_score
 
 class BaseTrainer(object):
     def __init__(self, label_map=None, args=None, logger=None, metrics_file=None):
@@ -38,13 +37,13 @@ class BaseTrainer(object):
 
 class PreTrainer(BaseTrainer):
     def __init__(self, train_data=None, val_data=None, test_data=None, model=None, label_map=None, args=None, logger=None, metrics_file=None):
-        """Initialize trainer with data, model, and configuration for error detection and NER.
+        """Initialize trainer with data, model, and configuration for NER pre-training.
         
         Args:
             train_data: Training dataset loader.
             val_data: Validation dataset loader.
             test_data: Test dataset loader.
-            model: Diffusion model for error detection and NER.
+            model: Diffusion model for NER.
             label_map (dict): Mapping of NER label indices to names.
             args: Training arguments.
             logger: Logger for training progress.
@@ -55,88 +54,73 @@ class PreTrainer(BaseTrainer):
         self.val_data = val_data
         self.test_data = test_data
         self.train_num_steps = len(self.train_data) * args.num_epochs if train_data else 0
-        self.best_dev = 0  # Best validation metric (error_f1)
+        self.best_dev_f1 = 0.0  # Best validation NER micro F1 score
         self.best_dev_epoch = None
-        self.best_error_f1 = 0.0
         self.model = model
         self.optimizer = None
         self.scheduler = None
-        self.best_model_path = os.path.join(args.save_path, f"{args.dataset_name}_{args.ner_model_name}_error_{'pretrain' if args.do_error_pretrain else 'finetune'}_best.pth")
-        self.final_model_path = os.path.join(args.save_path, f"{args.dataset_name}_{args.ner_model_name}_error_{'pretrain' if args.do_error_pretrain else 'finetune'}_final.pth")
+        self.best_model_path = os.path.join(args.save_path, f"{args.dataset_name}_{args.ner_model_name}_ner_{args.mode}_best.pth")
+        self.final_model_path = os.path.join(args.save_path, f"{args.dataset_name}_{args.ner_model_name}_ner_{args.mode}_final.pth")
         if self.metrics_file:
             with open(self.metrics_file, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['epoch', 'task', 'stage', 'batch', 'loss', 'alignment_loss', 'mse_loss', 
-                                'denoise_ce_loss', 'error_focal_loss', 'contrastive_loss', 
-                                'error_precision', 'error_recall', 'error_f1'])
+                writer.writerow(['epoch', 'stage', 'batch', 'loss', 'mse_loss', 'crf_loss', 'ner_f1'])
 
-    def train(self, task="error_pretrain", stage="train", epoch=0):
-        if self.args.use_prompt:
-            self.training_settings_with_prompt()
-        else:
-            self.training_settings_text_only()
-
+    def train(self, task="ner_pretrain", stage="train", epoch=0):
+        """Train the diffusion model for NER pre-training or finetuning."""
+        self.training_settings()
         self.model.train()
-        self.logger.info(f"***** Running {'error pre-training' if task == 'error_pretrain' else 'error fine-tuning'} *****")
+        self.logger.info(f"***** Running NER {task} *****")
         self.logger.info(f"  Num instances = {len(self.train_data) * self.args.batch_size}")
         self.logger.info(f"  Num epochs = {self.args.num_epochs}")
         self.logger.info(f"  Batch size = {self.args.batch_size}")
+        self.logger.info(f"  Gradient accumulation steps = {self.args.grad_accum_steps}")
         self.logger.info(f"  Learning rate = {self.args.lr}")
         self.logger.info(f"  Evaluate begin = {self.args.eval_begin_epoch}")
 
         self.step = 0
         self.no_improve = 0
         with tqdm(total=self.train_num_steps, postfix="loss:{0:<6.5f}", leave=False, dynamic_ncols=True) as pbar:
-            avg_loss, loss_count = 0, 0
-            avg_alignment_loss = 0.0
+            avg_loss = 0
+            loss_count = 0
             for epoch in range(self.args.num_epochs):
                 pbar.set_description_str(f"Epoch {epoch + 1}/{self.args.num_epochs}")
                 epoch_loss = 0.0
-                epoch_alignment_loss = 0.0
                 epoch_mse_loss = 0.0
-                epoch_denoise_ce_loss = 0.0
-                epoch_error_focal_loss = 0.0
-                epoch_contrastive_loss = 0.0
+                epoch_crf_loss = 0.0
                 batch_count = 0
-                all_true_masks, all_pred_masks, all_attn_masks = [], [], []
+                all_true_labels, all_pred_labels = [], []
                 self._batch_idx = 0
+                self.optimizer.zero_grad()  # Initialize gradients
 
                 for batch in self.train_data:
                     self.step += 1
                     self._batch_idx += 1
                     batch = [tup.to(self.args.device) if isinstance(tup, torch.Tensor) else tup for tup in batch]
-                    self.optimizer.zero_grad()
-                    loss, error_pred_mask, error_true_mask, targets_batch, attention_mask, words, img_names = self._step(
+                    loss, true_labels, pred_labels, attention_mask = self._step(
                         batch, task, stage, epoch
                     )
                     if loss is not None:
+                        # Scale loss for gradient accumulation
+                        loss = loss / self.args.grad_accum_steps
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                        self.optimizer.step()
-                        self.scheduler.step()
+                        if self.step % self.args.grad_accum_steps == 0:
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                            self.optimizer.step()
+                            self.scheduler.step()
+                            self.optimizer.zero_grad()
 
-                        batch_loss = loss.detach().cpu().item()
-                        batch_alignment_loss = self.model.alignment_loss.detach().cpu().item() if self.model.alignment_loss is not None else 0.0
+                        batch_loss = loss.detach().cpu().item()  # Unscaled loss for logging
                         batch_mse_loss = self.model.mse_loss.item() if self.model.mse_loss is not None else 0.0
-                        batch_denoise_ce_loss = self.model.denoise_ce_loss.item() if self.model.denoise_ce_loss is not None else 0.0
-                        batch_error_focal_loss = self.model.error_focal_loss.item() if self.model.error_focal_loss is not None else 0.0
-                        batch_contrastive_loss = self.model.contrastive_loss.item() if self.model.contrastive_loss is not None else 0.0
-                        avg_loss += batch_loss
-                        avg_alignment_loss += batch_alignment_loss
+                        batch_crf_loss = self.model.crf_loss.item() if self.model.crf_loss is not None else 0.0
                         epoch_loss += batch_loss
-                        epoch_alignment_loss += batch_alignment_loss
                         epoch_mse_loss += batch_mse_loss
-                        epoch_denoise_ce_loss += batch_denoise_ce_loss
-                        epoch_error_focal_loss += batch_error_focal_loss
-                        epoch_contrastive_loss += batch_contrastive_loss
+                        epoch_crf_loss += batch_crf_loss
                         batch_count += 1
 
-                        pred_mask_batch = (torch.sigmoid(error_pred_mask) > 0.5).long().detach().cpu().numpy()
-                        true_mask_batch = error_true_mask.detach().cpu().numpy()
-                        attn_mask_batch = attention_mask.detach().cpu().numpy()
-                        all_true_masks.extend(true_mask_batch)
-                        all_pred_masks.extend(pred_mask_batch)
-                        all_attn_masks.extend(attn_mask_batch)
+                        true_labels_batch, pred_labels_batch = self._gen_labels(pred_labels, true_labels, attention_mask)
+                        all_true_labels.extend(true_labels_batch)
+                        all_pred_labels.extend(pred_labels_batch)
 
                     if self.step % self.refresh_step == 0:
                         avg_loss_display = avg_loss / loss_count if loss_count > 0 else 0.0
@@ -145,32 +129,25 @@ class PreTrainer(BaseTrainer):
                         avg_loss, loss_count = 0, 0
 
                 if batch_count > 0:
-                    error_precision, error_recall, error_f1 = self.compute_f1_score(all_true_masks, all_pred_masks, all_attn_masks)
-                    avg_loss_epoch = epoch_loss / batch_count
-                    avg_alignment_loss_epoch = epoch_alignment_loss / batch_count
-                    avg_mse_loss_epoch = epoch_mse_loss / batch_count
-                    avg_denoise_ce_loss_epoch = epoch_denoise_ce_loss / batch_count
-                    avg_error_focal_loss_epoch = epoch_error_focal_loss / batch_count
-                    avg_contrastive_loss_epoch = epoch_contrastive_loss / batch_count
-                    self.logger.info(f"Epoch {epoch + 1}/{self.args.num_epochs}, Error Detection Precision: {error_precision:.4f}, Recall: {error_recall:.4f}, F1: {error_f1:.4f}, Alignment Loss: {avg_alignment_loss_epoch:.4f}")
+                    # Compute metrics with output_dict=True for robustness
+                    results_dict = classification_report(all_true_labels, all_pred_labels, digits=4, zero_division=0, output_dict=True)
+                    results_str = classification_report(all_true_labels, all_pred_labels, digits=4, zero_division=0)
+                    micro_f1 = results_dict.get('micro avg', {}).get('f1-score', 0.0)
+                    self.logger.info(f"***** Epoch {epoch + 1} Train Eval Results *****")
+                    self.logger.info("\n%s", results_str)
+                    self.logger.info(f"Epoch {epoch + 1}/{self.args.num_epochs}, NER Micro F1: {micro_f1:.4f}, MSE Loss: {epoch_mse_loss/batch_count:.4f}, CRF Loss: {epoch_crf_loss/batch_count:.4f}")
 
                     if self.metrics_file:
                         with open(self.metrics_file, 'a', newline='') as f:
                             writer = csv.writer(f)
                             writer.writerow([
                                 epoch + 1,
-                                task,
                                 "train",
-                                0,
-                                avg_loss_epoch,
-                                avg_alignment_loss_epoch,
-                                avg_mse_loss_epoch,
-                                avg_denoise_ce_loss_epoch,
-                                avg_error_focal_loss_epoch,
-                                avg_contrastive_loss_epoch,
-                                error_precision,
-                                error_recall,
-                                error_f1
+                                batch_count,
+                                epoch_loss / batch_count,
+                                epoch_mse_loss / batch_count,
+                                epoch_crf_loss / batch_count,
+                                micro_f1
                             ])
 
                 if epoch >= self.args.eval_begin_epoch:
@@ -184,27 +161,36 @@ class PreTrainer(BaseTrainer):
             torch.save(self.model.state_dict(), self.final_model_path)
             self.logger.info(f"Saved final model to {self.final_model_path}")
 
-    def evaluate(self, task="error_pretrain", stage="val", epoch=0):
+    def evaluate(self, task="ner_pretrain", stage="val", epoch=0):
+        """Evaluate the diffusion model on NER task."""
         self.model.eval()
-        self.logger.info(f"***** Running {stage} evaluation for {task} *****")
+        self.logger.info(f"***** Running {stage} evaluation for NER {task} *****")
         self.logger.info(f"  Num instances = {len(self.val_data) * self.args.batch_size}")
         self.logger.info(f"  Batch size = {self.args.batch_size}")
 
+        # Check if validation data is empty
+        if len(self.val_data) == 0:
+            self.logger.warning(f"Validation data loader is empty. Skipping evaluation.")
+            if self.metrics_file:
+                with open(self.metrics_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([epoch + 1, stage, 0, 0.0, 0.0, 0.0, 0.0])
+            self.model.train()
+            return False
+
         with torch.no_grad():
             with tqdm(total=len(self.val_data), leave=False, dynamic_ncols=True) as pbar:
-                metrics, val_loss, val_alignment_loss = self._eval_labels(pbar, self.val_data, epoch, task, stage)
-                error_precision, error_recall, error_f1 = metrics
-                self.logger.info(f"Epoch {epoch + 1}/{self.args.num_epochs}, Error Detection Precision: {error_precision:<6.5f}, Recall: {error_recall:<6.5f}, F1: {error_f1:<6.5f}, Alignment Loss: {val_alignment_loss:<6.5f}")
-                metric_for_saving = error_f1
+                metrics, val_loss, val_mse_loss, val_crf_loss = self._eval_labels(pbar, self.val_data, epoch, task, stage)
+                micro_f1 = metrics
+                self.logger.info(f"Epoch {epoch + 1}/{self.args.num_epochs}, NER Micro F1: {micro_f1:.4f}, MSE Loss: {val_mse_loss:.4f}, CRF Loss: {val_crf_loss:.4f}")
 
-                if metric_for_saving > self.best_error_f1:
-                    self.best_error_f1 = metric_for_saving
-                    self.best_dev = metric_for_saving
+                if micro_f1 > self.best_dev_f1:
+                    self.best_dev_f1 = micro_f1
                     self.best_dev_epoch = epoch + 1
                     self.no_improve = 0
                     if self.args.save_path:
                         torch.save(self.model.state_dict(), self.best_model_path)
-                        self.logger.info(f"Saved best model (F1: {metric_for_saving:.4f}) to {self.best_model_path}")
+                        self.logger.info(f"Saved best model (Micro F1: {micro_f1:.4f}) to {self.best_model_path}")
                 else:
                     self.no_improve += 1
                     if self.no_improve >= self.args.patience:
@@ -214,11 +200,22 @@ class PreTrainer(BaseTrainer):
         self.model.train()
         return False
 
-    def test(self, task="error_pretrain", stage="test", epoch=0):
+    def test(self, task="ner_pretrain", stage="test", epoch=0):
+        """Test the diffusion model on NER task."""
         self.model.eval()
-        self.logger.info(f"***** Running {stage} testing for {task} *****")
+        self.logger.info(f"***** Running {stage} testing for NER {task} *****")
         self.logger.info(f"  Num instances = {len(self.test_data) * self.args.batch_size}")
         self.logger.info(f"  Batch size = {self.args.batch_size}")
+
+        # Check if test data is empty
+        if len(self.test_data) == 0:
+            self.logger.warning(f"Test data loader is empty. Skipping testing.")
+            if self.metrics_file:
+                with open(self.metrics_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([epoch + 1, stage, 0, 0.0, 0.0, 0.0, 0.0])
+            self.model.train()
+            return 0.0
 
         if os.path.exists(self.best_model_path):
             self.logger.info(f"Loading best model from {self.best_model_path}")
@@ -229,203 +226,196 @@ class PreTrainer(BaseTrainer):
 
         with torch.no_grad():
             with tqdm(total=len(self.test_data), leave=False, dynamic_ncols=True) as pbar:
-                metrics, test_loss, test_alignment_loss = self._eval_labels(pbar, self.test_data, epoch, task, stage)
-                error_precision, error_recall, error_f1 = metrics
-                self.logger.info(f"Test Error Detection Precision: {error_precision:<6.5f}, Recall: {error_recall:<6.5f}, F1: {error_f1:<6.5f}, Alignment Loss: {test_alignment_loss:<6.5f}")
-
-                if self.metrics_file:
-                    with open(self.metrics_file, 'a', newline='') as f:
-                        writer = csv.writer(f)
-                        writer.writerow([
-                            epoch + 1,
-                            task,
-                            stage,
-                            0,
-                            test_loss,
-                            test_alignment_loss,
-                            self.model.mse_loss.item() if self.model.mse_loss is not None else 0.0,
-                            self.model.denoise_ce_loss.item() if self.model.denoise_ce_loss is not None else 0.0,
-                            self.model.error_focal_loss.item() if self.model.error_focal_loss is not None else 0.0,
-                            self.model.contrastive_loss.item() if self.model.contrastive_loss is not None else 0.0,
-                            error_precision,
-                            error_recall,
-                            error_f1
-                        ])
+                metrics, test_loss, test_mse_loss, test_crf_loss = self._eval_labels(pbar, self.test_data, epoch, task, stage)
+                micro_f1 = metrics
+                self.logger.info(f"Test NER Micro F1: {micro_f1:.4f}, MSE Loss: {test_mse_loss:.4f}, CRF Loss: {test_crf_loss:.4f}")
 
         self.model.train()
-        return error_f1
+        return micro_f1
 
-    def _step(self, batch, task="error_pretrain", stage="train", epoch=0):
+    def _step(self, batch, task="ner_pretrain", stage="train", epoch=0):
+        """Perform a single training or evaluation step."""
         if not hasattr(self, '_batch_idx'):
             self._batch_idx = 0
         self._batch_idx += 1
 
-        if self.args.use_prompt:
-            if task == "error_finetune":
-                assert len(batch) == 13, f"Expected 13 batch elements, got {len(batch)}"
-                (targets_unk, targets_new, char_input_ids, input_ids, token_type_ids, attention_mask,
-                 hvp_imgs, hvp_aux_imgs, mkg_imgs, mkg_aux_imgs, rcnn_imgs, words, img_names) = batch
-                targets_batch = (targets_unk, targets_new)
-            else:
-                assert len(batch) == 13, f"Expected 13 batch elements, got {len(batch)}"
-                (targets_unk, targets_noise, char_input_ids, input_ids, token_type_ids, attention_mask,
-                 hvp_imgs, hvp_aux_imgs, mkg_imgs, mkg_aux_imgs, rcnn_imgs, words, img_names) = batch
-                targets_batch = (targets_unk, targets_noise)
-        else:
-            if task == "error_finetune":
-                assert len(batch) == 8, f"Expected 8 batch elements, got {len(batch)}"
-                (targets_unk, targets_new, char_input_ids, input_ids, token_type_ids, attention_mask, words, img_names) = batch
-                targets_batch = (targets_unk, targets_new)
-            else:
-                assert len(batch) == 8, f"Expected 8 batch elements, got {len(batch)}"  # Fixed assertion
-                (targets_unk, targets_noise, char_input_ids, input_ids, token_type_ids, attention_mask, words, img_names) = batch
-                targets_batch = (targets_unk, targets_noise)
-                hvp_imgs, hvp_aux_imgs, mkg_imgs, mkg_aux_imgs, rcnn_imgs = None, None, None, None, None
-        words = list(map(list, zip(*words)))
+        # Handle variable batch sizes based on mode and use_prompt
+        expected_len = 13 if task == "ner_finetune" and self.args.use_prompt else \
+                       12 if task == "ner_pretrain" and self.args.use_prompt else \
+                       8 if task == "ner_finetune" else 7
+        if len(batch) != expected_len:
+            self.logger.error(f"Expected {expected_len} batch elements for task={task}, use_prompt={self.args.use_prompt}, got {len(batch)}")
+            raise ValueError(f"Expected {expected_len} batch elements, got {len(batch)}")
 
-        imgs, aux_imgs = self._select_images(hvp_imgs, hvp_aux_imgs, mkg_imgs, mkg_aux_imgs)
-
-        if task == "error_pretrain":
+        if task == "ner_finetune" and self.args.use_prompt:
+            (targets_unk, targets_new, char_input_ids, input_ids, token_type_ids, attention_mask,
+             hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs, words, img_names) = batch
+            labels = targets_new  # Use true labels for finetuning
+        elif task == "ner_pretrain" and self.args.use_prompt:
+            (targets_unk, char_input_ids, input_ids, token_type_ids, attention_mask,
+             hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs, words, img_names) = batch
             labels = targets_unk
-            targets_noise = targets_noise
-        else:
+        elif task == "ner_finetune":
+            (targets_unk, targets_new, char_input_ids, input_ids, token_type_ids, attention_mask,
+             words, img_names) = batch
+            hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs = None, None, None, None, None
             labels = targets_new
-            targets_noise = targets_unk
+        else:
+            (targets_unk, char_input_ids, input_ids, token_type_ids, attention_mask,
+             words, img_names) = batch
+            hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs = None, None, None, None, None
+            labels = targets_unk
+
+        words = list(map(list, zip(*words)))
+        images, aux_imgs = self._select_images(hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs)
 
         if stage == "train":
-            loss, recon_emissions, error_pred_logits, error_true_mask = self.model(
+            # Forward pass to get loss and emissions
+            loss, recon_emissions = self.model(
                 labels=labels,
-                targets_noise=targets_noise,
                 char_input_ids=char_input_ids,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
-                images=imgs,
+                images=images,
                 aux_imgs=aux_imgs,
-                rcnn_imgs=rcnn_imgs,
-                mode="pretrain" if task == "error_pretrain" else "finetune",
-                epoch=epoch
+                rcnn_imgs=rcnn_imgs
             )
-        elif stage in ["val", "test"]:
-            context_labels = targets_noise if task == "error_pretrain" else targets_unk
-            pred_labels, error_pred_logits = self.model.reverse_diffusion(
+            # Use CRF decoding for pred_labels to avoid memory-intensive reverse_diffusion
+            pred_labels = self.model.crf.decode(recon_emissions, mask=attention_mask.bool())
+        else:
+            # Optionally compute loss during validation/testing
+            if self.args.compute_eval_loss:
+                loss, recon_emissions = self.model(
+                    labels=labels,
+                    char_input_ids=char_input_ids,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=token_type_ids,
+                    images=images,
+                    aux_imgs=aux_imgs,
+                    rcnn_imgs=rcnn_imgs
+                )
+            else:
+                loss, recon_emissions = None, None
+            # Use reverse_diffusion for validation/testing to leverage mtl_ddpm's error detection
+            pred_labels = self.model.reverse_diffusion(
                 char_input_ids=char_input_ids,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
-                images=imgs,
+                images=images,
                 aux_imgs=aux_imgs,
                 rcnn_imgs=rcnn_imgs,
-                context_labels=context_labels,
-                steps=getattr(self.args, 'reverse_steps', 20),
-                temperature=0.8
-            )
-            loss, recon_emissions, error_pred_logits_model, error_true_mask = self.model(
-                labels=labels,
-                targets_noise=targets_noise,
-                char_input_ids=char_input_ids,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                images=imgs,
-                aux_imgs=aux_imgs,
-                rcnn_imgs=rcnn_imgs,
-                mode="pretrain" if task == "error_pretrain" else "finetune",
-                epoch=epoch
+                steps=getattr(self.args, 'reverse_steps', 10),
+                temperature=1.0
             )
 
-        return loss, error_pred_logits, error_true_mask, targets_batch, attention_mask, words, img_names
+        return loss, targets_unk, pred_labels, attention_mask
 
-    def _eval_labels(self, pbar, data, epoch, task="error_pretrain", stage="val"):
+    def _eval_labels(self, pbar, data, epoch, task="ner_pretrain", stage="val"):
+        """Evaluate NER labels for validation or test set."""
         self._batch_idx = 0
-        all_true_masks, all_pred_masks = [], []
+        all_true_labels, all_pred_labels = [], []
         total_loss = 0.0
-        total_alignment_loss = 0.0
         total_mse_loss = 0.0
-        total_denoise_ce_loss = 0.0
-        total_error_focal_loss = 0.0
-        total_contrastive_loss = 0.0
+        total_crf_loss = 0.0
         batch_count = 0
         pbar.set_description_str("Validation" if stage == "val" else "Testing")
 
+        # Log data loader size
+        self.logger.info(f"Processing {len(data)} batches in {stage} phase")
+
         for batch in data:
             batch = [tup.to(self.args.device) if isinstance(tup, torch.Tensor) else tup for tup in batch]
-            loss, error_pred_logits, error_true_mask, targets_batch, attention_mask, _, _ = self._step(
+            loss, true_labels, pred_labels, attention_mask = self._step(
                 batch, task, stage, epoch
             )
-            if loss is not None:
+            self.logger.info(f"Batch {self._batch_idx}: pred_labels lengths={[len(seq) for seq in pred_labels]}, true_labels shape={true_labels.shape if isinstance(true_labels, torch.Tensor) else len(true_labels)}")
+            
+            if loss is not None and self.args.compute_eval_loss:
                 total_loss += loss.detach().cpu().item()
-                total_alignment_loss += self.model.alignment_loss.detach().cpu().item() if self.model.alignment_loss is not None else 0.0
                 total_mse_loss += self.model.mse_loss.item() if self.model.mse_loss is not None else 0.0
-                total_denoise_ce_loss = self.model.denoise_ce_loss.item() if self.model.denoise_ce_loss is not None else 0.0
-                total_error_focal_loss += self.model.error_focal_loss.item() if self.model.error_focal_loss is not None else 0.0
-                total_contrastive_loss += self.model.contrastive_loss.item() if self.model.contrastive_loss is not None else 0.0
+                total_crf_loss += self.model.crf_loss.item() if self.model.crf_loss is not None else 0.0
                 batch_count += 1
 
-            pred_mask_batch = (torch.sigmoid(error_pred_logits) > 0.5).long().detach().cpu().numpy()
-            true_mask_batch = error_true_mask.detach().cpu().numpy()
-            attn_mask_batch = attention_mask.detach().cpu().numpy()
-            all_true_masks.extend(true_mask_batch)
-            all_pred_masks.extend(pred_mask_batch)
+            true_labels_batch, pred_labels_batch = self._gen_labels(pred_labels, true_labels, attention_mask)
+            all_true_labels.extend(true_labels_batch)
+            all_pred_labels.extend(pred_labels_batch)
 
             pbar.update()
-        pbar.close()
 
-        error_precision, error_recall, error_f1 = self.compute_f1_score(all_true_masks, all_pred_masks)
-        
-        if self.metrics_file and batch_count > 0:
+        pbar.close()
+        # Compute metrics with output_dict=True for robustness
+        micro_f1 = 0.0
+        if all_true_labels and all_pred_labels:
+            results_dict = classification_report(all_true_labels, all_pred_labels, digits=4, zero_division=0, output_dict=True)
+            results_str = classification_report(all_true_labels, all_pred_labels, digits=4, zero_division=0)
+            micro_f1 = results_dict.get('micro avg', {}).get('f1-score', 0.0)
+            self.logger.info(f"***** {stage.capitalize()} Eval Results *****")
+            self.logger.info("\n%s", results_str)
+        else:
+            self.logger.warning(f"No labels collected in {stage} phase. Setting micro_f1 to 0.0")
+
+        self.logger.info(f"{stage.capitalize()} NER Micro F1: {micro_f1:.4f}, Loss: {total_loss / batch_count if batch_count > 0 else 0.0:.4f}, MSE Loss: {total_mse_loss / batch_count if batch_count > 0 else 0.0:.4f}, CRF Loss: {total_crf_loss / batch_count if batch_count > 0 else 0.0:.4f}")
+
+        if self.metrics_file:
             with open(self.metrics_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     epoch + 1,
-                    task,
                     stage,
-                    0,
-                    total_loss / batch_count,
-                    total_alignment_loss / batch_count,
-                    total_mse_loss / batch_count,
-                    total_denoise_ce_loss / batch_count,
-                    total_error_focal_loss / batch_count,
-                    total_contrastive_loss / batch_count,
-                    error_precision,
-                    error_recall,
-                    error_f1
+                    batch_count,
+                    total_loss / batch_count if batch_count > 0 else 0.0,
+                    total_mse_loss / batch_count if batch_count > 0 else 0.0,
+                    total_crf_loss / batch_count if batch_count > 0 else 0.0,
+                    micro_f1
                 ])
 
-        return (error_precision, error_recall, error_f1), total_loss / batch_count, total_alignment_loss / batch_count
-    
-    def _select_images(self, hvp_imgs, hvp_aux_imgs, mkg_imgs, mkg_aux_imgs):
-        if self.model.ner_model_name == "hvpnet":
-            return hvp_imgs, hvp_aux_imgs
-        elif self.model.ner_model_name == "mkgformer":
-            return mkg_imgs, mkg_aux_imgs
-        return None, None
+        return micro_f1, total_loss / batch_count if batch_count > 0 else 0.0, total_mse_loss / batch_count if batch_count > 0 else 0.0, total_crf_loss / batch_count if batch_count > 0 else 0.0
 
-    def _gen_labels(self, logits, targets, token_attention_mask, return_indices=False):
-        if isinstance(logits, torch.Tensor):
-            logits = logits.detach().cpu().numpy()
-        elif isinstance(logits, list):
-            logits = np.array(logits)
-        if targets is None:
-            label_ids = np.zeros_like(logits)
-        elif isinstance(targets, torch.Tensor):
-            label_ids = targets.detach().cpu().numpy()
-        elif isinstance(targets, list):
-            label_ids = np.array(targets)
+    def _select_images(self, hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs):
+        """Select images based on ner_model_name or use all for mtl_ddpm."""
+        if self.args.ner_model_name == "hvpnet":
+            return hvp_img, hvp_aux_imgs
+        elif self.args.ner_model_name == "mkgformer":
+            return mkg_img, mkg_aux_imgs
+        else:
+            # For mtl_ddpm, use all images for error detection
+            return hvp_img or mkg_img, hvp_aux_imgs or mkg_aux_imgs
+            # Alternatively, use rcnn_imgs if mtl_ddpm focuses on diffusion
+            # return rcnn_imgs, None
+
+    def _gen_labels(self, pred_labels, true_labels, token_attention_mask, return_indices=False):
+        """Generate NER labels from pred_labels and true_labels, applying attention mask."""
+        # Convert true_labels to numpy if tensor
+        if isinstance(true_labels, torch.Tensor):
+            label_ids = true_labels.detach().cpu().numpy()
+        elif isinstance(true_labels, list):
+            label_ids = np.array(true_labels)
+        else:
+            label_ids = true_labels  # Handle None or unexpected types
+
+        # Convert attention_mask to numpy if tensor
         if isinstance(token_attention_mask, torch.Tensor):
             token_attention_mask = token_attention_mask.detach().cpu().numpy()
         elif isinstance(token_attention_mask, list):
             token_attention_mask = np.array(token_attention_mask)
-        
+
         label_map = {idx: label for label, idx in self.label_map.items()}
         given_label_batch, pred_label_batch = [], []
 
         for row in range(token_attention_mask.shape[0]):
             mask = token_attention_mask[row].astype(bool)
-            label_row_masked = label_ids[row][mask] if targets is not None else []
-            pred_row = logits[row][mask]
+            # Mask true labels
+            label_row_masked = label_ids[row][mask] if true_labels is not None else []
+            # pred_labels is a list of lists from crf.decode or reverse_diffusion
+            pred_row = pred_labels[row]
             given_label_sent, pred_label_sent = [], []
-            for column in range(len(label_row_masked)):
+
+            # Ensure pred_row and label_row_masked have the same length
+            valid_length = min(len(pred_row), len(label_row_masked))
+            for column in range(valid_length):
                 if column == 0 or label_map.get(label_row_masked[column], '') in ["X", "[SEP]"]:
                     continue
                 if return_indices:
@@ -439,56 +429,12 @@ class PreTrainer(BaseTrainer):
 
         return given_label_batch, pred_label_batch
 
-    def compute_f1_score(self, true_labels, pred_labels, attention_masks=None):
-        """Compute precision, recall, and F1 score for binary error detection using masks."""
-        true_flat, pred_flat = [], []
-        if attention_masks:
-            for true_mask, pred_mask, attn_mask in zip(true_labels, pred_labels, attention_masks):
-                mask = attn_mask.astype(bool)  # Use full attention mask
-                true_label_masked = true_mask[mask]
-                pred_label_masked = pred_mask[mask]
-                true_flat.extend(true_label_masked)
-                pred_flat.extend(pred_label_masked)
-        else:
-            for true_mask, pred_mask in zip(true_labels, pred_labels):
-                true_flat.extend(true_mask)
-                pred_flat.extend(pred_mask)
-        if not true_flat or all(t == 0 for t in true_flat):
-            return 0.0, 0.0, 0.0
-        precision = precision_score(true_flat, pred_flat, average='binary', zero_division=0)
-        recall = recall_score(true_flat, pred_flat, average='binary', zero_division=0)
-        f1 = f1_score(true_flat, pred_flat, average='binary', zero_division=0)
-        return precision, recall, f1
-
-    def training_settings_text_only(self):
+    def training_settings(self):
+        """Configure optimizer and scheduler for NER pre-training."""
         for name, param in self.model.named_parameters():
             if 'char_lstm' in name.lower():
                 param.requires_grad = False
         self.optimizer = AdamW(self.model.parameters(), lr=self.args.lr, weight_decay=1e-2)
-        self.scheduler = get_linear_schedule_with_warmup(
-            optimizer=self.optimizer,
-            num_warmup_steps=self.args.warmup_ratio * self.train_num_steps,
-            num_training_steps=self.train_num_steps
-        )
-        self.model.to(self.args.device)
-
-    def training_settings_with_prompt(self):
-        parameters = []
-        params = {'lr': 5e-2, 'weight_decay': 1e-2, 'params': []}
-        for name, param in self.model.named_parameters():
-            if 'crf' in name.lower() or name.lower().startswith('fc') or 'noise_pred' in name.lower() or 'error_pred' in name.lower():
-                params['params'].append(param)
-        parameters.append(params)
-        params = {'lr': self.args.lr, 'weight_decay': 1e-2, 'params': []}
-        for name, param in self.model.named_parameters():
-            if ('ner_model' in name.lower() and 'image_model' not in name.lower() and 'crf' not in name.lower() and not name.lower().startswith('fc')) or \
-               'vt_encoder' in name.lower() or 'time_mlp' in name.lower() or 'norm_' in name.lower() or '_attn' in name.lower():
-                params['params'].append(param)
-        parameters.append(params)
-        for name, param in self.model.named_parameters():
-            if 'char_lstm' in name.lower() or 'ner_model.image_model' in name.lower():
-                param.requires_grad = False
-        self.optimizer = AdamW(parameters)
         self.scheduler = get_linear_schedule_with_warmup(
             optimizer=self.optimizer,
             num_warmup_steps=self.args.warmup_ratio * self.train_num_steps,
