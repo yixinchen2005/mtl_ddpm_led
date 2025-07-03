@@ -274,22 +274,23 @@ class DiffusionModel(nn.Module):
         return loss, recon_emissions
 
     def reverse_diffusion(self, char_input_ids, input_ids, attention_mask, token_type_ids, 
-                         images, aux_imgs, rcnn_imgs, steps=20, temperature=1.0):
+                         images, aux_imgs, rcnn_imgs, steps=50, temperature=1.0):
         """Perform reverse diffusion to generate NER labels for pre-training."""
         batch_size, seq_len = input_ids.shape
         label_embeddings = torch.randn(batch_size, seq_len, self.args.label_hidden_dim, device=self.args.device)
-
-        step_sizes = torch.linspace(1.0, 0.1, steps, device=self.args.device)
+        step_sizes = torch.linspace(0.5, 0.05, steps, device=self.args.device)
         t_values = torch.linspace(steps - 1, 0, steps, device=self.args.device).long()
 
         for i, t in enumerate(t_values):
             t_tensor = torch.full((batch_size,), t, device=self.args.device, dtype=torch.long)
-            _, predicted_noise = self.denoise(
+            recon_emissions, predicted_noise = self.denoise(
                 label_embeddings, t=t_tensor, char_input_ids=char_input_ids, input_ids=input_ids, 
                 attention_mask=attention_mask, token_type_ids=token_type_ids, images=images, 
                 aux_imgs=aux_imgs, rcnn_imgs=rcnn_imgs
             )
-
+            # Log norms for debugging
+            # print(f"Step {i}, t={t}: recon_emissions norm={torch.norm(recon_emissions).item():.4f}, predicted_noise norm={torch.norm(predicted_noise).item():.4f}")
+            
             alpha_bar_t = self.noise_scheduler.alpha_bar[t].view(-1, 1, 1)
             alpha_t = self.noise_scheduler.alpha[t].view(-1, 1, 1)
             sigma_t = torch.sqrt(1 - alpha_bar_t) * torch.sqrt(1 - alpha_t) / torch.sqrt(alpha_bar_t)
@@ -299,10 +300,17 @@ class DiffusionModel(nn.Module):
                 z = torch.randn_like(label_embeddings) * step_sizes[i]
                 label_embeddings += sigma_t * z
 
+        # Log final label_embeddings norm
+        # print(f"Final label_embeddings norm={torch.norm(label_embeddings).item():.4f}")
+        
         recon_emissions, _ = self.denoise(
             label_embeddings, t=torch.zeros(batch_size, device=self.args.device, dtype=torch.long),
             char_input_ids=char_input_ids, input_ids=input_ids, attention_mask=attention_mask, 
             token_type_ids=token_type_ids, images=images, aux_imgs=aux_imgs, rcnn_imgs=rcnn_imgs
         )
-        diffusion_logits = recon_emissions / temperature
-        return diffusion_logits.argmax(dim=-1)
+        # Log final recon_emissions norm
+        # print(f"Final recon_emissions norm={torch.norm(recon_emissions).item():.4f}")
+        
+        # Use CRF decoding instead of argmax to align with training
+        pred_labels = self.crf.decode(recon_emissions, mask=attention_mask.bool())
+        return pred_labels

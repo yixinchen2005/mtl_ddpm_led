@@ -67,8 +67,12 @@ class PreTrainer(BaseTrainer):
                 writer.writerow(['epoch', 'stage', 'batch', 'loss', 'mse_loss', 'crf_loss', 'ner_f1'])
 
     def train(self, task="ner_pretrain", stage="train", epoch=0):
-        """Train the diffusion model for NER pre-training or finetuning."""
-        self.training_settings()
+        """Train the diffusion model for NER pre-training."""
+        # Select training settings based on use_prompt
+        if self.args.use_prompt:
+            self.training_settings_with_prompt()
+        else:
+            self.training_settings_text_only()
         self.model.train()
         self.logger.info(f"***** Running NER {task} *****")
         self.logger.info(f"  Num instances = {len(self.train_data) * self.args.batch_size}")
@@ -110,14 +114,16 @@ class PreTrainer(BaseTrainer):
                             self.scheduler.step()
                             self.optimizer.zero_grad()
 
-                        batch_loss = loss.detach().cpu().item()  # Unscaled loss for logging
+                        batch_loss = loss.detach().cpu().item() * self.args.grad_accum_steps  # Rescale for logging
                         batch_mse_loss = self.model.mse_loss.item() if self.model.mse_loss is not None else 0.0
                         batch_crf_loss = self.model.crf_loss.item() if self.model.crf_loss is not None else 0.0
                         epoch_loss += batch_loss
                         epoch_mse_loss += batch_mse_loss
                         epoch_crf_loss += batch_crf_loss
                         batch_count += 1
-
+                        # Update running average for tqdm display
+                        avg_loss += batch_loss
+                        loss_count += 1
                         true_labels_batch, pred_labels_batch = self._gen_labels(pred_labels, true_labels, attention_mask)
                         all_true_labels.extend(true_labels_batch)
                         all_pred_labels.extend(pred_labels_batch)
@@ -239,27 +245,16 @@ class PreTrainer(BaseTrainer):
             self._batch_idx = 0
         self._batch_idx += 1
 
-        # Handle variable batch sizes based on mode and use_prompt
-        expected_len = 13 if task == "ner_finetune" and self.args.use_prompt else \
-                       12 if task == "ner_pretrain" and self.args.use_prompt else \
-                       8 if task == "ner_finetune" else 7
+        # Handle variable batch sizes based on use_prompt
+        expected_len = 12 if self.args.use_prompt else 7
         if len(batch) != expected_len:
             self.logger.error(f"Expected {expected_len} batch elements for task={task}, use_prompt={self.args.use_prompt}, got {len(batch)}")
             raise ValueError(f"Expected {expected_len} batch elements, got {len(batch)}")
 
-        if task == "ner_finetune" and self.args.use_prompt:
-            (targets_unk, targets_new, char_input_ids, input_ids, token_type_ids, attention_mask,
-             hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs, words, img_names) = batch
-            labels = targets_new  # Use true labels for finetuning
-        elif task == "ner_pretrain" and self.args.use_prompt:
+        if self.args.use_prompt:
             (targets_unk, char_input_ids, input_ids, token_type_ids, attention_mask,
              hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs, words, img_names) = batch
             labels = targets_unk
-        elif task == "ner_finetune":
-            (targets_unk, targets_new, char_input_ids, input_ids, token_type_ids, attention_mask,
-             words, img_names) = batch
-            hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs = None, None, None, None, None
-            labels = targets_new
         else:
             (targets_unk, char_input_ids, input_ids, token_type_ids, attention_mask,
              words, img_names) = batch
@@ -281,7 +276,7 @@ class PreTrainer(BaseTrainer):
                 aux_imgs=aux_imgs,
                 rcnn_imgs=rcnn_imgs
             )
-            # Use CRF decoding for pred_labels to avoid memory-intensive reverse_diffusion
+            # Use CRF decoding for pred_labels
             pred_labels = self.model.crf.decode(recon_emissions, mask=attention_mask.bool())
         else:
             # Optionally compute loss during validation/testing
@@ -298,7 +293,7 @@ class PreTrainer(BaseTrainer):
                 )
             else:
                 loss, recon_emissions = None, None
-            # Use reverse_diffusion for validation/testing to leverage mtl_ddpm's error detection
+            # Use reverse_diffusion for validation/testing
             pred_labels = self.model.reverse_diffusion(
                 char_input_ids=char_input_ids,
                 input_ids=input_ids,
@@ -307,9 +302,12 @@ class PreTrainer(BaseTrainer):
                 images=images,
                 aux_imgs=aux_imgs,
                 rcnn_imgs=rcnn_imgs,
-                steps=getattr(self.args, 'reverse_steps', 10),
+                steps=getattr(self.args, 'reverse_steps', 50),
                 temperature=1.0
             )
+            # Log recon_emissions if available
+            if recon_emissions is not None:
+                self.logger.info(f"Batch {self._batch_idx}: recon_emissions norm={torch.norm(recon_emissions).item():.4f}")
 
         return loss, targets_unk, pred_labels, attention_mask
 
@@ -383,8 +381,6 @@ class PreTrainer(BaseTrainer):
         else:
             # For mtl_ddpm, use all images for error detection
             return hvp_img or mkg_img, hvp_aux_imgs or mkg_aux_imgs
-            # Alternatively, use rcnn_imgs if mtl_ddpm focuses on diffusion
-            # return rcnn_imgs, None
 
     def _gen_labels(self, pred_labels, true_labels, token_attention_mask, return_indices=False):
         """Generate NER labels from pred_labels and true_labels, applying attention mask."""
@@ -409,8 +405,8 @@ class PreTrainer(BaseTrainer):
             mask = token_attention_mask[row].astype(bool)
             # Mask true labels
             label_row_masked = label_ids[row][mask] if true_labels is not None else []
-            # pred_labels is a list of lists from crf.decode or reverse_diffusion
-            pred_row = pred_labels[row]
+            # pred_labels is a list of lists from crf.decode
+            pred_row = pred_labels[row] if isinstance(pred_labels, list) else pred_labels[row].cpu().numpy()
             given_label_sent, pred_label_sent = [], []
 
             # Ensure pred_row and label_row_masked have the same length
@@ -429,8 +425,8 @@ class PreTrainer(BaseTrainer):
 
         return given_label_batch, pred_label_batch
 
-    def training_settings(self):
-        """Configure optimizer and scheduler for NER pre-training."""
+    def training_settings_text_only(self):
+        """Configure optimizer and scheduler for text-only NER pre-training."""
         for name, param in self.model.named_parameters():
             if 'char_lstm' in name.lower():
                 param.requires_grad = False
@@ -441,3 +437,64 @@ class PreTrainer(BaseTrainer):
             num_training_steps=self.train_num_steps
         )
         self.model.to(self.args.device)
+        # Log trainable and frozen parameters
+        trainable = [name for name, param in self.model.named_parameters() if param.requires_grad]
+        frozen = [name for name, param in self.model.named_parameters() if not param.requires_grad]
+        self.logger.info(f"Text-only: Trainable parameters: {len(trainable)}, Frozen parameters: {len(frozen)}")
+
+    def training_settings_with_prompt(self):
+        """Configure optimizer and scheduler for NER pre-training with visual prompts."""
+        parameters = []
+        # Text parameters (bert or text)
+        params = {'lr': self.args.lr, 'weight_decay': 1e-2, 'params': []}
+        for name, param in self.model.named_parameters():
+            if 'vt_encoder.bert' in name.lower() or 'vt_encoder.text' in name.lower():
+                params['params'].append(param)
+        parameters.append(params)
+
+        # Vision parameters (image_model or vision)
+        params = {'lr': self.args.lr, 'weight_decay': 1e-2, 'params': []}
+        for name, param in self.model.named_parameters():
+            if 'vt_encoder.vision' in name.lower() or 'encoder_conv' in name.lower() or 'gates' in name.lower():
+                params['params'].append(param)
+        parameters.append(params)
+
+        # CRF, FC, and noise prediction layers
+        params = {'lr': 5e-2, 'weight_decay': 1e-2, 'params': []}
+        for name, param in self.model.named_parameters():
+            if 'crf' in name.lower() or name.lower().startswith('fc') or 'noise_pred' in name.lower() or 'label_mlp' in name.lower():
+                params['params'].append(param)
+        parameters.append(params)
+
+        # Attention layers
+        params = {'lr': 5e-6, 'weight_decay': 5e-8, 'params': []}
+        for name, param in self.model.named_parameters():
+            if '_attn' in name.lower():
+                params['params'].append(param)
+        parameters.append(params)
+
+        # Normalization and other layers (time_mlp, char_lstm_mlp)
+        params = {'lr': self.args.lr, 'weight_decay': 1e-2, 'params': []}
+        for name, param in self.model.named_parameters():
+            if 'norm_' in name.lower() or 'time_mlp' in name.lower() or 'char_lstm_mlp' in name.lower():
+                params['params'].append(param)
+        parameters.append(params)
+
+        # Freeze char_lstm and image_model (for hvpnet)
+        for name, param in self.model.named_parameters():
+            # if 'char_lstm' in name.lower() or (self.args.ner_model_name == 'hvpnet' and 'vt_encoder.image_model' in name.lower()):
+            if self.args.ner_model_name == 'hvpnet' and 'vt_encoder.image_model' in name.lower():
+                param.requires_grad = False
+
+        self.optimizer = AdamW(parameters)
+        self.scheduler = get_linear_schedule_with_warmup(
+            optimizer=self.optimizer,
+            num_warmup_steps=self.args.warmup_ratio * self.train_num_steps,
+            num_training_steps=self.train_num_steps
+        )
+        self.model.to(self.args.device)
+
+        # Log trainable and frozen parameters
+        trainable = [name for name, param in self.model.named_parameters() if param.requires_grad]
+        frozen = [name for name, param in self.model.named_parameters() if not param.requires_grad]
+        self.logger.info(f"With prompt: Trainable parameters: {len(trainable)}, Frozen parameters: {len(frozen)}")
