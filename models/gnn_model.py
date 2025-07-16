@@ -1,24 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch_geometric.nn import HeteroConv, SAGEConv
-from torch.utils.data import DataLoader
-import os
-import sys
-import time
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from processor.gnn_dataset import NERProcessor, NERDataset
-from utils.utils import test_embedding_robustness
-from transformers.optimization import get_linear_schedule_with_warmup
 import logging
-import argparse
-import numpy as np
-import csv
-from torch.utils.data import Subset
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-from torch_geometric.data import HeteroData
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -28,23 +11,6 @@ handler = logging.StreamHandler()
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s -   %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-
-def custom_collate_fn(batch):
-    batch = [item for item in batch if item is not None and isinstance(item, HeteroData)]
-    if not batch:
-        return None
-    valid_batch = []
-    for idx, data in enumerate(batch):
-        if 'label' not in data.node_types:
-            logger.warning(f"Skipping batch item: Missing 'label' node type")
-            continue
-        if 'y' not in data['label'] or data['label'].y is None:
-            logger.warning(f"Skipping batch item: Missing 'y' attribute for 'label' node type")
-            continue
-        valid_batch.append(data)
-    if not valid_batch:
-        return None
-    return valid_batch
 
 class HeteroLabelEmbeddingGNN(nn.Module):
     def __init__(self, label_embeddings, hidden_dim=32, num_labels=13):
@@ -69,295 +35,107 @@ class HeteroLabelEmbeddingGNN(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.2)
-
-    def forward(self, edge_index_dict, label_indices=None):
-        x_dict = {'label': self.relu(self.projection(self.label_embeddings))}
-        for conv in self.convs:
-            x_dict = conv(x_dict, edge_index_dict)
-            x_dict = {'label': self.relu(self.dropout(x_dict['label']))}
-        x_dict = {'label': self.norm(x_dict['label'])}
-        embeddings = x_dict['label']
-        logits = None
-        if label_indices is not None:
-            sequence_embeddings = embeddings[label_indices]
-            logits = self.decoder(sequence_embeddings)
-        return embeddings, logits
-
-class Trainer:
-    def __init__(self, train_data, val_data, test_data, model, label_map, args):
-        self.train_data = train_data
-        self.val_data = val_data
-        self.test_data = test_data
-        self.model = model
-        self.label_map = label_map
-        self.args = args
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model.to(self.device)
-        self.train_num_steps = len(self.train_data) * args.num_epochs
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=1e-2)
-        self.scheduler = get_linear_schedule_with_warmup(
-            optimizer=self.optimizer,
-            num_warmup_steps=args.warmup_ratio * self.train_num_steps,
-            num_training_steps=self.train_num_steps
-        )
-        self.best_robustness_score = 0.0
-        self.best_dev_epoch = None
-        self.no_improve = 0
-        self.step = 0
-        self.max_grad_norm = 1.0
-        self.best_embedding_table = None
-        self.best_model_path = os.path.join(args.save_path, f"{args.dataset_name}_hetero_best_decoder.pth")
-        self.best_embedding_path = os.path.join(args.save_path, f"{args.dataset_name}_hetero_best_embeddings_decoder.pth")
-        self.final_embedding_path = os.path.join(args.save_path, f"{args.dataset_name}_hetero_final_embeddings_decoder.pth")
-        self.semantic_similarities = {
-            "B-PER": ["I-PER"], "I-PER": ["B-PER"],
-            "B-ORG": ["I-ORG"], "I-ORG": ["B-ORG"],
-            "B-LOC": ["I-LOC"], "I-LOC": ["B-LOC"],
-            "B-MISC": ["I-MISC"], "I-MISC": ["B-MISC"],
-            "O": [], "X": [], "[PAD]": [], "[CLS]": [], "[SEP]": []
+        self.label_map = {
+            "[PAD]": 0, "O": 1, "B-MISC": 2, "I-MISC": 3, "B-PER": 4, "I-PER": 5,
+            "B-ORG": 6, "I-ORG": 7, "B-LOC": 8, "I-LOC": 9, "X": 10, "[CLS]": 11, "[SEP]": 12
         }
-        os.makedirs(args.save_path, exist_ok=True)
-        if args.metrics_file:
-            with open(self.args.metrics_file, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['epoch', 'stage', 'batch', 'loss', 'decoder_loss', 'locality_1.0', 'clusteredness_1.0', 'separation'])
+        self.inverse_label_map = {idx: label for label, idx in self.label_map.items()}
 
-    def decoder_loss(self, embeddings, logits, label_indices, clean_weight=0.5, sigma=0.5, num_noise_samples=5):
-        if label_indices.size(0) == 0:
-            return torch.tensor(0.0, device=self.device)
-        clean_loss = F.cross_entropy(logits, label_indices, reduction='mean')
-        noisy_embeddings = embeddings[label_indices].unsqueeze(1) + sigma * torch.randn(label_indices.size(0), num_noise_samples, embeddings.size(1), device=self.device)
-        noisy_embeddings = noisy_embeddings.view(-1, embeddings.size(1))
-        noisy_labels = label_indices.repeat_interleave(num_noise_samples)
-        noisy_logits = self.model.decoder(noisy_embeddings)
-        noisy_loss = F.cross_entropy(noisy_logits, noisy_labels, reduction='mean')
-        total_loss = clean_weight * clean_loss + (1.0 - clean_weight) * noisy_loss
-        return total_loss
-
-    def _step(self, batch, stage="train"):
-        if batch is None or not batch or all(not isinstance(data, HeteroData) for data in batch):
-            logger.warning("Invalid batch, skipping")
-            return None
-        embeddings = []
-        logits = []
-        label_indices_list = []
-        for data in batch:
-            if not isinstance(data, HeteroData):
+    def _create_edge_index_dict(self, label_indices):
+        """
+        Create edge_index_dict from batched label indices for diffusion model training.
+        Args:
+            label_indices (torch.Tensor): Shape [batch_size, seq_len]
+        Returns:
+            list: List of edge_index_dict for each sequence in the batch
+        """
+        batch_size, seq_len = label_indices.size()
+        edge_index_dicts = []
+        for b in range(batch_size):
+            indices = label_indices[b]
+            if seq_len < 2:
+                logger.debug(f"Batch {b}: Sequence too short: {seq_len} tokens")
+                edge_index_dicts.append(None)
                 continue
-            edge_index_dict = {
-                k: data[k]['edge_index'].to(self.device)
-                for k in data.edge_types if 'edge_index' in data[k] and isinstance(data[k]['edge_index'], torch.Tensor)
-            }
-            label_indices = data['label'].y.to(self.device)
-            if stage == "train":
-                emb, log = self.model(edge_index_dict, label_indices)
-            else:
-                with torch.no_grad():
-                    emb, log = self.model(edge_index_dict, label_indices)
-            embeddings.append(emb)
-            logits.append(log)
-            label_indices_list.append(label_indices)
-        if not embeddings:
-            logger.warning("No valid embeddings, skipping")
-            return None
-        embeddings = torch.stack(embeddings, dim=0)
-        mean_embeddings = embeddings.mean(dim=0)
-        valid_logits = torch.cat(logits, dim=0)
-        valid_label_indices = torch.cat(label_indices_list, dim=0)
-        loss = self.decoder_loss(mean_embeddings, valid_logits, valid_label_indices, clean_weight=self.args.clean_weight)
-        return (loss, [mean_embeddings], label_indices_list)
-    
-    def train(self, epochs=None):
-        epochs = epochs or self.args.num_epochs
-        num_labels = len(self.label_map)
-        hidden_dim = self.model.decoder.in_features
-        with tqdm(total=self.train_num_steps, postfix="loss:{0:<6.5f}", leave=False, dynamic_ncols=True) as pbar:
-            for epoch in range(epochs):
-                self.model.train()
-                total_loss = 0.0
-                total_samples = 0
-                pbar.set_description_str(f"Epoch {epoch + 1}/{epochs}")
-                epoch_start_time = time.time()
-                for batch in self.train_data:
-                    self.step += 1
-                    if not batch or all(not isinstance(data, HeteroData) for data in batch):
-                        continue
-                    result = self._step(batch, stage="train")
-                    if result is None:
-                        continue
-                    loss, embeddings, label_indices_list = result
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    if self.step % self.args.grad_accum_steps == 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                        self.optimizer.step()
-                        self.scheduler.step()
-                    batch_samples = sum(len(n) for n in label_indices_list)
-                    total_samples += batch_samples
-                    total_loss += loss.item() * batch_samples
-                    if self.step % self.args.refresh_step == 0:
-                        pbar.update(self.args.refresh_step)
-                        pbar.set_postfix_str(f"loss: {total_loss / total_samples if total_samples > 0 else 0.0:<6.5f}")
-                if total_samples > 0:
-                    avg_loss = total_loss / total_samples
-                    logger.info(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}, "
-                               f"Decoder Loss: {avg_loss:.4f}, "
-                               f"Time: {time.time() - epoch_start_time:.2f}s")
-                    if self.args.metrics_file:
-                        with open(self.args.metrics_file, 'a', newline='') as f:
-                            writer = csv.writer(f)
-                            writer.writerow([
-                                epoch + 1, "train", len(self.train_data),
-                                avg_loss, avg_loss,
-                                0.0, 0.0, 0.0
-                            ])
-                if epoch >= self.args.eval_begin_epoch:
-                    _, _, _, _, early_stop = self.evaluate(epoch, stage="val")
-                    if early_stop:
-                        break
-            torch.cuda.empty_cache()
-            pbar.close()
-        self.model.eval()
-        embedding_sums = torch.zeros(num_labels, hidden_dim).to(self.device)
-        embedding_counts = torch.zeros(num_labels).to(self.device)
-        with torch.no_grad():
-            for batch in self.train_data:
-                if not batch:
-                    continue
-                for data in batch:
-                    if not isinstance(data, HeteroData) or 'label' not in data.node_types:
-                        logger.warning("Skipping invalid data in final embedding computation: missing 'label'")
-                        continue
-                    edge_index_dict = {
-                        k: data[k]['edge_index'].to(self.device)
-                        for k in data.edge_types if 'edge_index' in data[k] and isinstance(data[k]['edge_index'], torch.Tensor)
-                    }
-                    embeddings, _ = self.model(edge_index_dict)
-                    for label_idx in range(num_labels):
-                        embedding_sums[label_idx] += embeddings[label_idx]
-                        embedding_counts[label_idx] += 1
-        final_embedding_table = embedding_sums / (embedding_counts.unsqueeze(1) + 1e-8)
-        if self.args.save_path:
-            torch.save(final_embedding_table, self.final_embedding_path)
-            logger.info(f"Saved final embeddings to {self.final_embedding_path}")
-        return self.best_embedding_table if self.best_embedding_table is not None else final_embedding_table
+            labels = [self.inverse_label_map.get(idx.item(), 'X') for idx in indices]
+            edge_types = ['inside', 'to_entity', 'exit', 'background']
+            edge_index_dict = {}
+            src_indices = indices[:-1]
+            tgt_indices = indices[1:]
+            src_labels = labels[:-1]
+            tgt_labels = labels[1:]
 
-    def evaluate(self, epoch, stage="val"):
-        self.model.eval()
-        num_labels = len(self.label_map)
-        hidden_dim = self.model.decoder.in_features
-        embedding_sums = torch.zeros(num_labels, hidden_dim).to(self.device)
-        embedding_counts = torch.zeros(num_labels).to(self.device)
-        total_loss = 0.0
-        total_samples = 0
-        data_loader = self.val_data if stage == "val" else self.test_data
-        for batch in data_loader:
-            if not batch:
-                continue
-            result = self._step(batch, stage=stage)
-            if result is None:
-                continue
-            loss, embeddings, label_indices_list = result
-            mean_embeddings = embeddings[0]
-            batch_samples = sum(len(n) for n in label_indices_list)
-            total_samples += batch_samples
-            total_loss += loss.item() * batch_samples
-            for label_idx in range(num_labels):
-                embedding_sums[label_idx] += mean_embeddings[label_idx]
-                embedding_counts[label_idx] += 1
-        embedding_table = embedding_sums / (embedding_counts.unsqueeze(1) + 1e-8)
-        results = test_embedding_robustness(
-            embeddings=embedding_table,
-            labels=list(self.label_map.keys()),
-            semantic_similarities=self.semantic_similarities,
-            num_samples=1000,
-            noise_levels=[0.01, 0.1, 1.0]
-        )
-        locality_1_0 = results[1.0]["locality"]
-        clusteredness_1_0 = results[1.0]["clusteredness"]
-        separation = results[1.0]["separation"]
-        avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
-        logger.info(f"{stage.capitalize()} Loss: {avg_loss:.4f}, "
-                   f"Decoder Loss: {avg_loss:.4f}")
-        logger.info(f"{stage.capitalize()} Robustness Metrics (sigma=1.0): Locality: {locality_1_0:.4f}, "
-                   f"Clusteredness: {clusteredness_1_0:.4f}, Separation: {separation:.4f}")
-        if self.args.metrics_file:
-            with open(self.args.metrics_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    epoch + 1, stage, len(data_loader),
-                    avg_loss, avg_loss,
-                    locality_1_0, clusteredness_1_0, separation
-                ])
-        early_stop = False
-        if stage == "val":
-            robustness_score = (locality_1_0 + clusteredness_1_0) / 2
-            if robustness_score > self.best_robustness_score:
-                self.best_robustness_score = robustness_score
-                self.best_dev_epoch = epoch + 1
-                self.no_improve = 0
-                self.best_embedding_table = embedding_table
-                if self.args.save_path:
-                    torch.save(self.model.state_dict(), self.best_model_path)
-                    torch.save(self.best_embedding_table, self.best_embedding_path)
-                    logger.info(f"Saved best model and embeddings (Robustness Score: {robustness_score:.4f}) to {self.best_model_path} and {self.best_embedding_path}")
-            else:
-                self.no_improve += 1
-                if self.no_improve >= self.args.patience:
-                    logger.info(f"Early stopping at epoch {epoch + 1}")
-                    early_stop = True
-        return embedding_table, locality_1_0, clusteredness_1_0, separation, early_stop
+            inside_mask = torch.zeros(len(src_indices), dtype=torch.bool)
+            to_entity_mask = torch.zeros(len(src_indices), dtype=torch.bool)
+            exit_mask = torch.zeros(len(src_indices), dtype=torch.bool)
+            background_mask = torch.zeros(len(src_indices), dtype=torch.bool)
 
-    def test(self, epoch=0):
-        if os.path.exists(self.best_model_path):
-            logger.info(f"Loading best model from {self.best_model_path}")
-            self.model.load_state_dict(torch.load(self.best_model_path))
-            logger.info("Load model successful!")
+            for i, (src, tgt) in enumerate(zip(src_labels, tgt_labels)):
+                if src.startswith('B-') and tgt.startswith('I-') and src[2:] == tgt[2:]:
+                    inside_mask[i] = True
+                elif src.startswith('I-') and tgt.startswith('I-') and src[2:] == tgt[2:]:
+                    inside_mask[i] = True
+                elif src == 'O' and tgt.startswith('B-'):
+                    to_entity_mask[i] = True
+                elif src.startswith(('B-', 'I-')) and tgt == 'O':
+                    exit_mask[i] = True
+                else:
+                    background_mask[i] = True
+
+            for etype, mask in zip(edge_types, [inside_mask, to_entity_mask, exit_mask, background_mask]):
+                if mask.any():
+                    edges = torch.stack([src_indices[mask], tgt_indices[mask]], dim=0)
+                    rev_edges = torch.stack([tgt_indices[mask], src_indices[mask]], dim=0)
+                    edge_index = torch.cat([edges, rev_edges], dim=1)
+                    if edge_index.size(1) > 0 and edge_index.max().item() < len(self.label_map):
+                        edge_index_dict[('label', etype, 'label')] = edge_index
+            edge_index_dicts.append(edge_index_dict if edge_index_dict else None)
+        return edge_index_dicts
+
+    def forward(self, edge_index_dict=None, label_indices=None):
+        """
+        Forward pass for the GNN.
+        Args:
+            edge_index_dict (dict, optional): Dictionary of edge indices (pre-training).
+            label_indices (torch.Tensor, optional): Shape [batch_size, seq_len] or [seq_len] (joint training or pre-training).
+        Returns:
+            tuple: (embeddings, sequence_embeddings, logits)
+                   - Pre-training: (embeddings, None, logits)
+                   - Joint training: (None, sequence_embeddings, None)
+        """
+        x_dict = {'label': self.relu(self.projection(self.label_embeddings))}
+        is_pretraining = edge_index_dict is not None
+
+        if is_pretraining:
+            edge_index_dict = {k: v.to(self.label_embeddings.device) for k, v in edge_index_dict.items()}
+            for conv in self.convs:
+                x_dict = conv(x_dict, edge_index_dict)
+                x_dict = {'label': self.relu(self.dropout(x_dict['label']))}
+            x_dict = {'label': self.norm(x_dict['label'])}
+            embeddings = x_dict['label']
+            if label_indices is not None:
+                if label_indices.dim() == 2:
+                    label_indices = label_indices.squeeze(0)
+                logits = self.decoder(embeddings[label_indices])
+                return embeddings, None, logits
+            return embeddings, None, None
         else:
-            logger.warning(f"Best model not found at {self.best_model_path}. Using current model.")
-        embedding_table, _, _, _, _ = self.evaluate(epoch, stage="test")
-        return embedding_table
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Heterogeneous GNN for NER embeddings")
-    parser.add_argument("--local_cache_path", type=str, default="/home/yixin/workspace/huggingface/", help="Path to cache")
-    parser.add_argument("--lm_name", type=str, default="bert-base-uncased", help="Language model name")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
-    parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs")
-    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
-    parser.add_argument("--warmup_ratio", type=float, default=0.2, help="Warmup ratio for scheduler")
-    parser.add_argument("--eval_begin_epoch", type=int, default=1, help="Epoch to start validation")
-    parser.add_argument("--patience", type=int, default=5, help="Patience for early stopping")
-    parser.add_argument("--save_path", type=str, default="checkpoints", help="Path to save models and embeddings")
-    parser.add_argument("--dataset_name", type=str, default="ner", help="Dataset name for checkpoint files")
-    parser.add_argument("--metrics_file", type=str, default="metrics.csv", help="File to save metrics")
-    parser.add_argument("--refresh_step", type=int, default=2, help="Steps to update progress bar")
-    parser.add_argument("--clean_weight", type=float, default=0.5, help="Weight for clean loss in decoder_loss (noisy weight is 1.0 - clean_weight)")
-    args = parser.parse_args()
-    logger.info("Initializing NERProcessor and NERDataset...")
-    processor = NERProcessor(args)
-    dataset = NERDataset(processor, max_seq_len=128)
-    indices = list(range(len(dataset)))
-    train_indices, temp_indices = train_test_split(indices, test_size=0.2, random_state=42)
-    val_indices, test_indices = train_test_split(temp_indices, test_size=0.5, random_state=42)
-    train_dataset = Subset(dataset, train_indices)
-    val_dataset = Subset(dataset, val_indices)
-    test_dataset = Subset(dataset, test_indices)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=custom_collate_fn, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=custom_collate_fn, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=custom_collate_fn, num_workers=0)
-    logger.info("Initializing Heterogeneous GNN model...")
-    model = HeteroLabelEmbeddingGNN(label_embeddings=processor.label_embeddings, hidden_dim=32, num_labels=len(processor.get_label_mapping()))
-    logger.info("Training Heterogeneous GNN with decoder loss...")
-    trainer = Trainer(
-        train_data=train_loader,
-        val_data=val_loader,
-        test_data=test_loader,
-        model=model,
-        label_map=processor.get_label_mapping(),
-        args=args
-    )
-    embedding_table = trainer.train()
-    logger.info("Testing on test set...")
-    test_embedding_table = trainer.test()
+            if label_indices is None:
+                return None, None, None
+            edge_index_dicts = self._create_edge_index_dict(label_indices)
+            sequence_embeddings = []
+            for i, edge_index_dict in enumerate(edge_index_dicts):
+                if edge_index_dict is None:
+                    seq_len = label_indices.size(1)
+                    sequence_embeddings.append(torch.zeros(seq_len, self.projection.out_features, device=self.label_embeddings.device))
+                    continue
+                edge_index_dict = {k: v.to(self.label_embeddings.device) for k, v in edge_index_dict.items()}
+                x_dict_b = {'label': x_dict['label'].clone()}
+                for conv in self.convs:
+                    x_dict_b = conv(x_dict_b, edge_index_dict)
+                    x_dict_b = {'label': self.relu(self.dropout(x_dict_b['label']))}
+                x_dict_b = {'label': self.norm(x_dict_b['label'])}
+                seq_emb = x_dict_b['label'][label_indices[i]]
+                sequence_embeddings.append(seq_emb)
+            sequence_embeddings = torch.stack(sequence_embeddings)
+            return None, sequence_embeddings, None

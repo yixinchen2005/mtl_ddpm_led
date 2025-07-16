@@ -23,7 +23,7 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 logger.info(f"Number of handlers: {len(logger.handlers)}")
 
-class NERProcessor:
+class GNNProcessor:
     def __init__(self, args, twitter_path='data/NER_data/twitter2015', conll_path='data/NER_data/conll2003'):
         """
         Initialize processor for Twitter2015 and CoNLL-2003 NER datasets.
@@ -292,13 +292,13 @@ class NERProcessor:
         logger.info(f"Processed {len(data_list)} valid heterogeneous graphs in {total_time:.2f} seconds, avg {total_time / num_sequences if num_sequences > 0 else 0:.4f}s per sequence")
         return data_list
 
-class NERDataset(Dataset):
+class GNNDataset(Dataset):
     def __init__(self, processor, max_seq_len=128):
         """
         Initialize dataset for GNN training with label-level heterogeneous graphs.
 
         Args:
-            processor (NERProcessor): Processor instance with loaded data.
+            processor (GNNProcessor): Processor instance with loaded data.
             max_seq_len (int): Maximum sequence length for truncation.
         """
         super().__init__()
@@ -306,7 +306,7 @@ class NERDataset(Dataset):
         self.max_seq_len = max_seq_len
         start_time = time.time()
         self.data = processor.process()
-        logger.info(f"NERDataset initialized in {time.time() - start_time:.2f} seconds")
+        logger.info(f"GNNDataset initialized in {time.time() - start_time:.2f} seconds")
         self.label_map = processor.get_label_mapping()
 
     def __len__(self):
@@ -333,7 +333,7 @@ class NERDataset(Dataset):
 
 if __name__ == "__main__":
     """
-    Test NERProcessor and NERDataset to verify label-level graph construction and embedding robustness.
+    Test GNNProcessor and GNNDataset to verify label-level graph construction and embedding robustness.
     """
     args = argparse.Namespace(
         local_cache_path="/home/yixin/workspace/huggingface/",
@@ -346,10 +346,10 @@ if __name__ == "__main__":
         "B-MISC": ["I-MISC"], "I-MISC": ["B-MISC"],
         "O": [], "X": [], "[PAD]": [], "[CLS]": [], "[SEP]": []
     }
-    logger.info("Initializing NERProcessor and NERDataset...")
+    logger.info("Initializing GNNProcessor and GNNDataset...")
     start_time = time.time()
-    processor = NERProcessor(args)
-    dataset = NERDataset(processor, max_seq_len=128)
+    processor = GNNProcessor(args)
+    dataset = GNNDataset(processor, max_seq_len=128)
     logger.info(f"Test setup completed in {time.time() - start_time:.2f} seconds")
     num_samples = min(3, len(dataset))
     inverse_label_map = {idx: label for label, idx in processor.get_label_mapping().items()}
