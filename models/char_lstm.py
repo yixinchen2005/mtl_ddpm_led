@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 class CharLSTM(nn.Module):
-    def __init__(self, char2int_dict, int2char_dict, n_hidden=256, n_layers=2, bidirectional=False,
+    def __init__(self, char2int_dict, int2char_dict, n_hidden=64, n_layers=2, bidirectional=True,
                  drop_prob=0.3):
         super().__init__()
         self.drop_prob = drop_prob
@@ -20,14 +20,14 @@ class CharLSTM(nn.Module):
         self.lstm = nn.LSTM(len(self.char2int), n_hidden, n_layers, 
                             dropout=drop_prob, batch_first=True, bidirectional=bidirectional)
         self.dropout = nn.Dropout(drop_prob)
-        self.fc = nn.Linear(self.n_hidden*self.D, len(self.char2int))
+        self.fc = nn.Linear(self.n_hidden * self.D, len(self.char2int))
         self.init_weights()
     
     def forward(self, x, hc):
         assert x.dim() == 3, "Expected 3D input"
         x, (h, c) = self.lstm(x, hc)
         x = self.dropout(x)
-        x = x.reshape(x.size()[0]*x.size()[1], -1)
+        x = x.reshape(x.size()[0] * x.size()[1], -1)
         x = self.fc(x)
         return x, (h, c)
     
@@ -36,7 +36,7 @@ class CharLSTM(nn.Module):
         nn.init.xavier_uniform_(self.fc.weight)
     
     def init_hidden(self, dims):
-        dims = (self.D*self.n_layers, *dims, self.n_hidden)
+        dims = (self.D * self.n_layers, *dims, self.n_hidden)
         device = self.lstm.weight_ih_l0.device
         return (torch.zeros(dims, device=device), torch.zeros(dims, device=device))
 
@@ -50,9 +50,8 @@ def get_batches(arr, n_seqs, n_steps):
        n_seqs: Batch size, the number of sequences per batch
        n_steps: Number of sequence steps per batch
     '''
-    
     batch_size = n_seqs * n_steps
-    n_batches = len(arr)//batch_size
+    n_batches = len(arr) // batch_size
     
     # Keep only enough characters to make full batches
     arr = arr[:n_batches * batch_size]
@@ -61,19 +60,16 @@ def get_batches(arr, n_seqs, n_steps):
     arr = arr.reshape((n_seqs, -1))
     
     for n in range(0, arr.shape[1], n_steps):
-
-        # Skip last batch if incomplete #
+        # Skip last batch if incomplete
         if n + n_steps >= arr.shape[1]:
             continue
         
         # The features
-        x = arr[:, n:n+n_steps]
+        x = arr[:, n:n + n_steps]
         
         # The targets, shifted by one
         y = torch.zeros_like(x)
-
-        y[:, :-1], y[:, -1] = x[:, 1:], arr[:, n+n_steps]
-
+        y[:, :-1], y[:, -1] = x[:, 1:], arr[:, n + n_steps]
         yield x, y
 
 def load_from_folder(data_folder_path, tokenizer):
@@ -124,28 +120,24 @@ def train(net, data, epochs=10, n_seqs=10, n_steps=50, lr=0.001, clip=5, val_fra
     
         Arguments
         ---------
-        
         net: CharRNN network
         data: text data to train the network
         epochs: Number of epochs to train
         n_seqs: Number of mini-sequences per mini-batch, aka batch size
-        n_steps: Number of character steps per mini-batch
+        n_steps: Number of character steps per batch
         lr: learning rate
         clip: gradient clipping
         val_frac: Fraction of data to hold out for validation
         cuda: Train with CUDA on a GPU
         print_every: Number of steps for printing training and validation loss
-    
     '''
-    
     net.train()
     
     opt = torch.optim.Adam(net.parameters(), lr=lr)
-    
     criterion = nn.CrossEntropyLoss()
     
     # create training and validation data
-    val_idx = int(len(data)*(1-val_frac))
+    val_idx = int(len(data) * (1 - val_frac))
     data, val_data = data[:val_idx], data[val_idx:]
     
     if cuda:
@@ -155,11 +147,9 @@ def train(net, data, epochs=10, n_seqs=10, n_steps=50, lr=0.001, clip=5, val_fra
     n_chars = len(net.char2int)
     
     for e in range(epochs):
-        
         h = net.init_hidden((n_seqs,))
         
         for x, y in get_batches(data, n_seqs, n_steps):
-            
             counter += 1
             
             # One-hot encode our data and make them Torch tensors
@@ -169,49 +159,39 @@ def train(net, data, epochs=10, n_seqs=10, n_steps=50, lr=0.001, clip=5, val_fra
             if cuda:
                 inputs, targets, h = inputs.cuda(), targets.cuda(), tuple([each.cuda() for each in h])
 
-            # Creating new variables for the hidden state, otherwise
-            # we'd backprop through the entire training history
+            # Creating new variables for the hidden state
             h = tuple([each.data for each in h])
 
             net.zero_grad()
             
             output, h = net.forward(inputs, h)
             
-            loss = criterion(output, targets.view(n_seqs*n_steps).type(torch.cuda.LongTensor))
-
+            loss = criterion(output, targets.view(n_seqs * n_steps).type(torch.cuda.LongTensor))
             loss.backward()
             
-            # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
+            # Clip gradients to prevent exploding gradients
             nn.utils.clip_grad_norm_(net.parameters(), clip)
-
             opt.step()
             
             if counter % print_every == 0:
-                
                 # Get validation loss
                 val_h = net.init_hidden((n_seqs,))
                 val_losses = []
                 
                 for x, y in get_batches(val_data, n_seqs, n_steps):
-                    
-                    # One-hot encode our data and make them Torch tensors
                     x = F.one_hot(x, n_chars)
                     inputs, targets = x.to(torch.float32), y
                     
-                    # Creating new variables for the hidden state, otherwise
-                    # we'd backprop through the entire training history
                     val_h = tuple([each.data for each in val_h])
                     
                     if cuda:
                         inputs, targets, val_h = inputs.cuda(), targets.cuda(), tuple([each.cuda() for each in val_h])
 
                     output, val_h = net.forward(inputs, val_h)
-
-                    val_loss = criterion(output, targets.view(n_seqs*n_steps).type(torch.cuda.LongTensor))
-                
+                    val_loss = criterion(output, targets.view(n_seqs * n_steps).type(torch.cuda.LongTensor))
                     val_losses.append(val_loss.item())
                 
-                print("Epoch: {}/{}...".format(e+1, epochs),
+                print("Epoch: {}/{}...".format(e + 1, epochs),
                       "Step: {}...".format(counter),
                       "Loss: {:.4f}...".format(loss.item()),
                       "Val Loss: {:.4f}".format(np.mean(val_losses)))
@@ -224,7 +204,7 @@ if __name__ == "__main__":
 
     tokenizer = AutoTokenizer.from_pretrained(os.path.join(local_cache_path, lm_name))
     char2int, int2char, encoded = load_from_folder(data_folder_path, tokenizer)
-    net = CharLSTM(char2int, int2char, n_hidden=512, n_layers=2, bidirectional=True)
+    net = CharLSTM(char2int, int2char, n_hidden=64, n_layers=2, bidirectional=True)
     train(net, encoded, epochs=20, n_seqs=n_seq, n_steps=n_char, lr=0.001, cuda=True, print_every=10)
 
     torch.save(net.state_dict(), "char_lstm.pth")

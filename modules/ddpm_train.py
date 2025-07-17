@@ -480,11 +480,26 @@ class PreTrainer(BaseTrainer):
                 params['params'].append(param)
         parameters.append(params)
 
-        # Freeze char_lstm and image_model (for hvpnet)
+        # CharLSTM parameters (excluding char_lstm_mlp)
+        params = {'lr': 1e-4, 'weight_decay': 5e-3, 'params': []}
         for name, param in self.model.named_parameters():
-            # if 'char_lstm' in name.lower() or (self.args.ner_model_name == 'hvpnet' and 'vt_encoder.image_model' in name.lower()):
+            if name.lower().startswith('char_lstm.') and 'char_lstm_mlp' not in name.lower():
+                params['params'].append(param)
+        parameters.append(params)
+
+        # Freeze image_model (for hvpnet)
+        for name, param in self.model.named_parameters():
             if self.args.ner_model_name == 'hvpnet' and 'vt_encoder.image_model' in name.lower():
                 param.requires_grad = False
+
+        # Verify no parameters are assigned to multiple groups
+        param_ids = []
+        for group in parameters:
+            for param in group['params']:
+                param_id = id(param)
+                if param_id in param_ids:
+                    raise ValueError(f"Parameter {param_id} appears in multiple groups")
+                param_ids.append(param_id)
 
         self.optimizer = AdamW(parameters)
         self.scheduler = get_linear_schedule_with_warmup(
@@ -498,3 +513,4 @@ class PreTrainer(BaseTrainer):
         trainable = [name for name, param in self.model.named_parameters() if param.requires_grad]
         frozen = [name for name, param in self.model.named_parameters() if not param.requires_grad]
         self.logger.info(f"With prompt: Trainable parameters: {len(trainable)}, Frozen parameters: {len(frozen)}")
+        self.logger.info(f"Trainable parameter names: {trainable}")
