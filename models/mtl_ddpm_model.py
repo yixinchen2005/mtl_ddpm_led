@@ -52,6 +52,7 @@ class DiffusionModel(nn.Module):
         
         # Time embedding MLP for diffusion steps
         self.time_mlp = nn.Linear(1, self.args.time_hidden_dim)
+        self.time_projection = nn.Linear(self.args.time_hidden_dim, 128)  # Project to 128
         self.noise_scheduler = NoiseScheduler(
             timesteps=self.args.train_steps, 
             device=self.args.device,
@@ -59,19 +60,19 @@ class DiffusionModel(nn.Module):
         )
         
         # Label encoder
-        self.label_embedding_table = label_embedding_table
+        self.label_embedding_table = label_embedding_table  # [num_labels, 32]
         self.label_mlp = nn.Sequential(
-            nn.Linear(768, self.args.label_hidden_dim),
+            nn.Linear(768, 128),  # Project GNN embeddings to 128
             nn.ReLU(),
-            nn.Linear(self.args.label_hidden_dim, self.args.label_hidden_dim)
+            nn.Linear(128, 128)
         )
-        self.label_pos_encoder = PositionalEncoding(self.args.label_hidden_dim, self.args.max_seq_len)
+        self.label_pos_encoder = PositionalEncoding(128, self.args.max_seq_len)
         self.label_self_attn = MultiAttn(
-            query_dim=self.args.label_hidden_dim, 
-            key_dim=self.args.label_hidden_dim, 
-            value_dim=self.args.label_hidden_dim, 
-            emb_dim=self.args.label_hidden_dim, 
-            num_heads=1, 
+            query_dim=128, 
+            key_dim=128, 
+            value_dim=128, 
+            emb_dim=128, 
+            num_heads=4, 
             dropout_rate=0.3
         )
         
@@ -80,13 +81,14 @@ class DiffusionModel(nn.Module):
         self.char_lstm = CharLSTM(char2int_dict, int2char_dict, n_hidden=args.char_hidden_dim, 
                                  n_layers=2, bidirectional=True, drop_prob=0.3)
         self.char_lstm.load_state_dict(torch.load(os.path.join(clstm_path, "char_lstm.pth")))
-        self.char_lstm_mlp = nn.Linear(2 * self.char_lstm.n_layers * args.char_hidden_dim, args.char_hidden_dim)
-        self.char_pos_encoder = PositionalEncoding(args.char_hidden_dim, self.args.max_seq_len)
+        self.char_lstm_mlp = nn.Linear(2 * self.char_lstm.n_layers * args.char_hidden_dim, args.char_hidden_dim)  # 256 -> 64
+        self.char_projection = nn.Linear(args.char_hidden_dim, 128)  # Project to 128
+        self.char_pos_encoder = PositionalEncoding(128, self.args.max_seq_len)
         self.char_self_attn = MultiAttn(
-            query_dim=args.char_hidden_dim, 
-            key_dim=args.char_hidden_dim, 
-            value_dim=args.char_hidden_dim, 
-            emb_dim=args.char_hidden_dim, 
+            query_dim=128, 
+            key_dim=128, 
+            value_dim=128, 
+            emb_dim=128, 
             num_heads=4, 
             dropout_rate=0.3
         )
@@ -95,69 +97,70 @@ class DiffusionModel(nn.Module):
         if ner_model_name == "hvpnet":
             self.ner_model = HMNeTNERModel(num_labels, args)
             self.vt_encoder = self.ner_model.core
-            vt_hidden_size = self.vt_encoder.bert.config.hidden_size
+            vt_hidden_size = self.vt_encoder.bert.config.hidden_size  # 768
         elif ner_model_name == "mkgformer":
             self.ner_model = UnimoCRFModel(num_labels, args)
             self.vt_encoder = self.ner_model.model
-            vt_hidden_size = self.vt_encoder.text_config.hidden_size
+            vt_hidden_size = self.vt_encoder.text_config.hidden_size  # 768
         else:
             raise ValueError("Invalid ner_model_name")
-        self.vt_hidden_size = vt_hidden_size
+        self.vt_hidden_size = 128  # Projected size
+        self.vt_projection = nn.Linear(vt_hidden_size, 128)  # Project from 768 to 128
         
         # Cross-attention layers
         self.label_vt_attn = MultiAttn(
-            query_dim=self.args.label_hidden_dim,
-            key_dim=vt_hidden_size,
-            value_dim=vt_hidden_size,
-            emb_dim=self.args.label_hidden_dim,
+            query_dim=128,
+            key_dim=128,
+            value_dim=128,
+            emb_dim=128,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.label_char_attn = MultiAttn(
-            query_dim=self.args.label_hidden_dim,
-            key_dim=self.args.char_hidden_dim,
-            value_dim=self.args.char_hidden_dim,
-            emb_dim=self.args.label_hidden_dim,
+            query_dim=128,
+            key_dim=128,
+            value_dim=128,
+            emb_dim=128,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.vt_label_attn = MultiAttn(
-            query_dim=vt_hidden_size,
-            key_dim=self.args.label_hidden_dim,
-            value_dim=self.args.label_hidden_dim,
-            emb_dim=vt_hidden_size,
+            query_dim=128,
+            key_dim=128,
+            value_dim=128,
+            emb_dim=128,
             num_heads=4, 
             dropout_rate=0.4
         )
         self.vt_char_attn = MultiAttn(
-            query_dim=vt_hidden_size,
-            key_dim=self.args.char_hidden_dim,
-            value_dim=self.args.char_hidden_dim,
-            emb_dim=vt_hidden_size,
+            query_dim=128,
+            key_dim=128,
+            value_dim=128,
+            emb_dim=128,
             num_heads=4, 
             dropout_rate=0.4
         )
         
         # Normalization layers
-        self.norm_label_vt = nn.LayerNorm(self.args.label_hidden_dim)
-        self.norm_label_char = nn.LayerNorm(self.args.label_hidden_dim)
-        self.norm_vt_label = nn.LayerNorm(self.vt_hidden_size)
-        self.norm_vt_char = nn.LayerNorm(self.vt_hidden_size)
+        self.norm_label_vt = nn.LayerNorm(128)
+        self.norm_label_char = nn.LayerNorm(128)
+        self.norm_vt_label = nn.LayerNorm(128)
+        self.norm_vt_char = nn.LayerNorm(128)
         
         # CRF layer
         self.crf = CRF(num_labels, batch_first=True)
         
         # Output layers
-        self.fc = nn.Linear(self.vt_hidden_size + self.args.label_hidden_dim, num_labels)
-        self.noise_pred = nn.Linear(self.vt_hidden_size + self.args.label_hidden_dim, self.args.label_hidden_dim)
+        self.fc = nn.Linear(128 + 128, num_labels)  # Concatenated label and VT features
+        self.noise_pred = nn.Linear(128 + 128, 128)  # Output matches label_hidden_dim
         self.dropout = nn.Dropout(0.5)
 
     def get_label_embedding(self, labels, attention_mask=None):
         """Convert label indices to embeddings with positional encoding and self-attention."""
         assert labels is not None, "labels required"
         assert labels.max() < self.label_embedding_table.shape[0], "Label indices out of range"
-        label_features = self.label_embedding_table[labels]
-        label_features = self.label_mlp(label_features)
+        label_features = self.label_embedding_table[labels]  # [batch_size, max_seq_len, 32]
+        label_features = self.label_mlp(label_features)  # [batch_size, max_seq_len, 128]
         label_features = self.label_pos_encoder(label_features)
         label_mask = (~attention_mask.bool()) if attention_mask is not None else None
         label_features = self.label_self_attn(
@@ -178,8 +181,9 @@ class DiffusionModel(nn.Module):
             hc = self.char_lstm.init_hidden((char_input.shape[0],))
             hc = tuple([each.to(self.args.device) for each in hc])
             _, char_hidden = self.char_lstm(char_input, hc)
-            char_features = char_hidden[0].transpose(0, 2).contiguous().view(bsz, self.args.max_seq_len, -1)
-            char_features = self.char_lstm_mlp(char_features)
+            char_features = char_hidden[0].transpose(0, 2).contiguous().view(bsz, self.args.max_seq_len, -1)  # [batch_size, max_seq_len, 256]
+            char_features = self.char_lstm_mlp(char_features)  # [batch_size, max_seq_len, 64]
+            char_features = self.char_projection(char_features)  # [batch_size, max_seq_len, 128]
             char_features = self.char_pos_encoder(char_features)
             attn_mask = (~attention_mask.bool()) if attention_mask is not None else None
             char_features = self.char_self_attn(char_features, char_features, char_features, mask=attn_mask)
@@ -192,13 +196,14 @@ class DiffusionModel(nn.Module):
             out = self.vt_encoder(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, 
                                   pixel_values=images, aux_values=aux_imgs, rcnn_values=rcnn_imgs, return_dict=True)
             vt_features = out.last_hidden_state
-        assert vt_features.shape == (bsz, self.args.max_seq_len, self.vt_hidden_size), "VT output shape mismatch"
+        vt_features = self.vt_projection(vt_features)  # [batch_size, max_seq_len, 128]
+        assert vt_features.shape == (bsz, self.args.max_seq_len, 128), "VT output shape mismatch"
         
         return char_features, vt_features
 
     def corrupt(self, t, labels, attention_mask):
         """Corrupt labels with diffusion noise."""
-        label_features = self.get_label_embedding(labels, attention_mask)
+        label_features = self.get_label_embedding(labels, attention_mask)  # [batch_size, max_seq_len, 128]
         corrupt_label_embeddings, noise = self.noise_scheduler.add_noise(label_features, t, attention_mask)
         return corrupt_label_embeddings, noise
 
@@ -206,7 +211,8 @@ class DiffusionModel(nn.Module):
                 token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None):
         """Denoise corrupted embeddings, predicting noise and NER logits."""
         t = t.float().view(-1, 1)
-        time_features = torch.sin(self.time_mlp(t)).unsqueeze(1)
+        time_features = torch.sin(self.time_mlp(t)).unsqueeze(1)  # [batch_size, 1, 32]
+        time_features = self.time_projection(time_features)  # [batch_size, 1, 128]
         char_features, vt_features = self.get_context_embedding(
             char_input_ids, input_ids, attention_mask, token_type_ids, images, aux_imgs, rcnn_imgs
         )
@@ -235,7 +241,7 @@ class DiffusionModel(nn.Module):
         
         label_features_comb = (label_vt_features + label_char_features) / (1 + (char_features is not None))
         vt_features_comb = (vt_label_features + vt_char_features) / (1 + (char_features is not None))
-        features = torch.cat((label_features_comb, vt_features_comb), dim=-1)
+        features = torch.cat((label_features_comb, vt_features_comb), dim=-1)  # [batch_size, max_seq_len, 256]
         
         features = self.dropout(features)
         recon_emissions = self.fc(features)
@@ -263,7 +269,7 @@ class DiffusionModel(nn.Module):
 
         # Compute losses
         mse_loss = F.mse_loss(predicted_noise, noise)
-        crf_loss = -1 * self.crf(recon_emissions, labels, mask=attention_mask.bool(), reduction='mean')
+        crf_loss = -self.crf(recon_emissions, labels, mask=attention_mask.bool(), reduction='mean')
         
         # Combine losses
         loss = 0.5 * mse_loss + 0.5 * crf_loss
@@ -277,7 +283,7 @@ class DiffusionModel(nn.Module):
                          images, aux_imgs, rcnn_imgs, steps=50, temperature=1.0):
         """Perform reverse diffusion to generate NER labels for pre-training."""
         batch_size, seq_len = input_ids.shape
-        label_embeddings = torch.randn(batch_size, seq_len, self.args.label_hidden_dim, device=self.args.device)
+        label_embeddings = torch.randn(batch_size, seq_len, 128, device=self.args.device)
         step_sizes = torch.linspace(0.5, 0.05, steps, device=self.args.device)
         t_values = torch.linspace(steps - 1, 0, steps, device=self.args.device).long()
 
@@ -288,9 +294,6 @@ class DiffusionModel(nn.Module):
                 attention_mask=attention_mask, token_type_ids=token_type_ids, images=images, 
                 aux_imgs=aux_imgs, rcnn_imgs=rcnn_imgs
             )
-            # Log norms for debugging
-            # print(f"Step {i}, t={t}: recon_emissions norm={torch.norm(recon_emissions).item():.4f}, predicted_noise norm={torch.norm(predicted_noise).item():.4f}")
-            
             alpha_bar_t = self.noise_scheduler.alpha_bar[t].view(-1, 1, 1)
             alpha_t = self.noise_scheduler.alpha[t].view(-1, 1, 1)
             sigma_t = torch.sqrt(1 - alpha_bar_t) * torch.sqrt(1 - alpha_t) / torch.sqrt(alpha_bar_t)
@@ -300,17 +303,12 @@ class DiffusionModel(nn.Module):
                 z = torch.randn_like(label_embeddings) * step_sizes[i]
                 label_embeddings += sigma_t * z
 
-        # Log final label_embeddings norm
-        # print(f"Final label_embeddings norm={torch.norm(label_embeddings).item():.4f}")
-        
         recon_emissions, _ = self.denoise(
             label_embeddings, t=torch.zeros(batch_size, device=self.args.device, dtype=torch.long),
             char_input_ids=char_input_ids, input_ids=input_ids, attention_mask=attention_mask, 
             token_type_ids=token_type_ids, images=images, aux_imgs=aux_imgs, rcnn_imgs=rcnn_imgs
         )
-        # Log final recon_emissions norm
-        # print(f"Final recon_emissions norm={torch.norm(recon_emissions).item():.4f}")
         
-        # Use CRF decoding instead of argmax to align with training
+        # Use CRF decoding
         pred_labels = self.crf.decode(recon_emissions, mask=attention_mask.bool())
         return pred_labels

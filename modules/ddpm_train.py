@@ -441,7 +441,7 @@ class PreTrainer(BaseTrainer):
         trainable = [name for name, param in self.model.named_parameters() if param.requires_grad]
         frozen = [name for name, param in self.model.named_parameters() if not param.requires_grad]
         self.logger.info(f"Text-only: Trainable parameters: {len(trainable)}, Frozen parameters: {len(frozen)}")
-
+   
     def training_settings_with_prompt(self):
         """Configure optimizer and scheduler for NER pre-training with visual prompts."""
         parameters = []
@@ -473,10 +473,11 @@ class PreTrainer(BaseTrainer):
                 params['params'].append(param)
         parameters.append(params)
 
-        # Normalization and other layers (time_mlp, char_lstm_mlp)
+        # Normalization and projection layers (time_mlp, char_lstm_mlp, char_projection, vt_projection, time_projection)
         params = {'lr': self.args.lr, 'weight_decay': 1e-2, 'params': []}
         for name, param in self.model.named_parameters():
-            if 'norm_' in name.lower() or 'time_mlp' in name.lower() or 'char_lstm_mlp' in name.lower():
+            if ('norm_' in name.lower() or 'time_mlp' in name.lower() or 'char_lstm_mlp' in name.lower() or 
+                'char_projection' in name.lower() or 'vt_projection' in name.lower() or 'time_projection' in name.lower()):
                 params['params'].append(param)
         parameters.append(params)
 
