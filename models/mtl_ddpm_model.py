@@ -5,8 +5,12 @@ from torchcrf import CRF
 from .char_lstm import CharLSTM
 from .bert_model import HMNeTNERModel
 from .unimo_model import UnimoCRFModel
+from .gnn_model import HeteroLabelEmbeddingGNN
 from utils.attention import MultiAttn, PositionalEncoding
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 class NoiseScheduler:
     def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02, device="cpu", schedule_type="cosine"):
@@ -43,7 +47,7 @@ class NoiseScheduler:
         return noisy_x, noise
 
 class DiffusionModel(nn.Module):
-    def __init__(self, args, num_labels=0, label_embedding_table=None, clstm_path=None, ner_model_name="hvpnet"):
+    def __init__(self, args, num_labels=0, label_embeddings=None, gnn_path=None, clstm_path=None, ner_model_name="hvpnet"):
         """Initialize the diffusion model for NER pre-training."""
         super().__init__()
         self.args = args
@@ -60,19 +64,18 @@ class DiffusionModel(nn.Module):
         )
         
         # Label encoder
-        self.label_embedding_table = label_embedding_table  # [num_labels, 768]
-        self.label_mlp = nn.Sequential(
-            nn.Linear(self.args.label_hidden_dim, self.args.embed_dim),  # 768 -> embed_dim
-            nn.ReLU(),
-            nn.Linear(self.args.embed_dim, self.args.embed_dim)
-        )
+        self.label_encoder = HeteroLabelEmbeddingGNN(label_embeddings=label_embeddings, hidden_dim=32, num_labels=num_labels)
+        if gnn_path:
+            logger.info(f"Loading GNN weights from {os.path.join(gnn_path, 'gnn_hetero_best_decoder.pth')}")
+            self.label_encoder.load_state_dict(torch.load(os.path.join(gnn_path, "gnn_hetero_best_decoder.pth")))
+        self.label_projection = nn.Linear(32, self.args.embed_dim)  # GNN output: 32 -> embed_dim
         self.label_pos_encoder = PositionalEncoding(self.args.embed_dim, self.args.max_seq_len)
         self.label_self_attn = MultiAttn(
             query_dim=self.args.embed_dim, 
             key_dim=self.args.embed_dim, 
             value_dim=self.args.embed_dim, 
             emb_dim=self.args.embed_dim, 
-            num_heads=4, 
+            num_heads=min(4, self.args.embed_dim // 16),  # Ensure divisibility
             dropout_rate=0.3
         )
         
@@ -81,15 +84,15 @@ class DiffusionModel(nn.Module):
         self.char_lstm = CharLSTM(char2int_dict, int2char_dict, n_hidden=args.char_hidden_dim, 
                                  n_layers=2, bidirectional=True, drop_prob=0.3)
         self.char_lstm.load_state_dict(torch.load(os.path.join(clstm_path, "char_lstm.pth")))
-        self.char_lstm_mlp = nn.Linear(2 * self.char_lstm.n_layers * args.char_hidden_dim, args.char_hidden_dim)  # 256 -> 64
-        self.char_projection = nn.Linear(args.char_hidden_dim, self.args.embed_dim)  # 64 -> embed_dim
+        self.char_lstm_mlp = nn.Linear(2 * self.char_lstm.n_layers * self.args.char_hidden_dim, self.args.char_hidden_dim)  # 256 -> 64
+        self.char_projection = nn.Linear(self.args.char_hidden_dim, self.args.embed_dim)  # 64 -> embed_dim
         self.char_pos_encoder = PositionalEncoding(self.args.embed_dim, self.args.max_seq_len)
         self.char_self_attn = MultiAttn(
             query_dim=self.args.embed_dim, 
             key_dim=self.args.embed_dim, 
             value_dim=self.args.embed_dim, 
             emb_dim=self.args.embed_dim, 
-            num_heads=4, 
+            num_heads=min(4, self.args.embed_dim // 16), 
             dropout_rate=0.3
         )
         
@@ -113,7 +116,7 @@ class DiffusionModel(nn.Module):
             key_dim=self.args.embed_dim,
             value_dim=self.args.embed_dim,
             emb_dim=self.args.embed_dim,
-            num_heads=4, 
+            num_heads=min(4, self.args.embed_dim // 16), 
             dropout_rate=0.4
         )
         self.label_char_attn = MultiAttn(
@@ -121,7 +124,7 @@ class DiffusionModel(nn.Module):
             key_dim=self.args.embed_dim,
             value_dim=self.args.embed_dim,
             emb_dim=self.args.embed_dim,
-            num_heads=4, 
+            num_heads=min(4, self.args.embed_dim // 16), 
             dropout_rate=0.4
         )
         self.vt_label_attn = MultiAttn(
@@ -129,7 +132,7 @@ class DiffusionModel(nn.Module):
             key_dim=self.args.embed_dim,
             value_dim=self.args.embed_dim,
             emb_dim=self.args.embed_dim,
-            num_heads=4, 
+            num_heads=min(4, self.args.embed_dim // 16), 
             dropout_rate=0.4
         )
         self.vt_char_attn = MultiAttn(
@@ -137,7 +140,7 @@ class DiffusionModel(nn.Module):
             key_dim=self.args.embed_dim,
             value_dim=self.args.embed_dim,
             emb_dim=self.args.embed_dim,
-            num_heads=4, 
+            num_heads=min(4, self.args.embed_dim // 16), 
             dropout_rate=0.4
         )
         
@@ -156,11 +159,14 @@ class DiffusionModel(nn.Module):
         self.dropout = nn.Dropout(0.5)
 
     def get_label_embedding(self, labels, attention_mask=None):
-        """Convert label indices to embeddings with positional encoding and self-attention."""
+        """Convert label indices to embeddings with GNN, positional encoding, and self-attention."""
         assert labels is not None, "labels required"
-        assert labels.max() < self.label_embedding_table.shape[0], "Label indices out of range"
-        label_features = self.label_embedding_table[labels]  # [batch_size, max_seq_len, label_hidden_dim]
-        label_features = self.label_mlp(label_features)  # [batch_size, max_seq_len, embed_dim]
+        labels = labels.to(self.args.device)
+        if labels.max() >= self.num_labels:
+            logger.warning(f"Label indices out of range: max={labels.max().item()}, num_labels={self.num_labels}")
+        _, label_features, _ = self.label_encoder(label_indices=labels)  # [batch_size, max_seq_len, 32]
+        logger.debug(f"Label features shape after GNN: {label_features.shape}")
+        label_features = self.label_projection(label_features)  # [batch_size, max_seq_len, embed_dim]
         label_features = self.label_pos_encoder(label_features)
         label_mask = (~attention_mask.bool()) if attention_mask is not None else None
         label_features = self.label_self_attn(

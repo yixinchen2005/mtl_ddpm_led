@@ -6,6 +6,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from transformers.optimization import get_linear_schedule_with_warmup
 from seqeval.metrics import classification_report
+import logging
 
 class BaseTrainer(object):
     def __init__(self, label_map=None, args=None, logger=None, metrics_file=None):
@@ -62,9 +63,9 @@ class PreTrainer(BaseTrainer):
         self.best_model_path = os.path.join(args.save_path, f"{args.dataset_name}_{args.ner_model_name}_ner_{args.mode}_best.pth")
         self.final_model_path = os.path.join(args.save_path, f"{args.dataset_name}_{args.ner_model_name}_ner_{args.mode}_final.pth")
         if self.metrics_file:
-            with open(self.metrics_file, 'w', newline='') as f:
+            with open(self.metrics_file, 'a', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['epoch', 'stage', 'batch', 'loss', 'mse_loss', 'crf_loss', 'ner_f1'])
+                writer.writerow(['c3a7e8b9', 'epoch', 'stage', 'batch', 'loss', 'mse_loss', 'crf_loss', 'ner_f1'])
 
     def train(self, task="ner_pretrain", stage="train", epoch=0):
         """Train the diffusion model for NER pre-training."""
@@ -110,6 +111,12 @@ class PreTrainer(BaseTrainer):
                         loss.backward()
                         if self.step % self.args.grad_accum_steps == 0:
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                            # Log gradients for key components
+                            for name, param in self.model.named_parameters():
+                                if ('label_encoder' in name.lower() or 'label_projection' in name.lower() or 
+                                    'char_lstm' in name.lower() or 'char_projection' in name.lower() or 
+                                    'vt_projection' in name.lower() or 'time_projection' in name.lower()) and param.grad is not None:
+                                    self.logger.debug(f"Step {self.step}: Gradient norm for {name}: {torch.norm(param.grad).item():.4f}")
                             self.optimizer.step()
                             self.scheduler.step()
                             self.optimizer.zero_grad()
@@ -427,10 +434,38 @@ class PreTrainer(BaseTrainer):
 
     def training_settings_text_only(self):
         """Configure optimizer and scheduler for text-only NER pre-training."""
+        parameters = []
+        # Main model parameters (excluding char_lstm and label_encoder)
+        params = {'lr': self.args.lr, 'weight_decay': 1e-2, 'params': []}
         for name, param in self.model.named_parameters():
-            if 'char_lstm' in name.lower():
-                param.requires_grad = False
-        self.optimizer = AdamW(self.model.parameters(), lr=self.args.lr, weight_decay=1e-2)
+            if not ('char_lstm' in name.lower() or 'label_encoder' in name.lower()):
+                params['params'].append(param)
+        parameters.append(params)
+
+        # CharLSTM parameters (excluding char_lstm_mlp)
+        params = {'lr': 1e-4, 'weight_decay': 5e-3, 'params': []}
+        for name, param in self.model.named_parameters():
+            if name.lower().startswith('char_lstm.') and 'char_lstm_mlp' not in name.lower():
+                params['params'].append(param)
+        parameters.append(params)
+
+        # LabelEncoder parameters (excluding label_projection)
+        params = {'lr': 1e-4, 'weight_decay': 5e-3, 'params': []}
+        for name, param in self.model.named_parameters():
+            if name.lower().startswith('label_encoder.') and 'label_projection' not in name.lower():
+                params['params'].append(param)
+        parameters.append(params)
+
+        # Verify no parameters are assigned to multiple groups
+        param_ids = []
+        for group in parameters:
+            for param in group['params']:
+                param_id = id(param)
+                if param_id in param_ids:
+                    raise ValueError(f"Parameter {param_id} appears in multiple groups")
+                param_ids.append(param_id)
+
+        self.optimizer = AdamW(parameters)
         self.scheduler = get_linear_schedule_with_warmup(
             optimizer=self.optimizer,
             num_warmup_steps=self.args.warmup_ratio * self.train_num_steps,
@@ -441,6 +476,7 @@ class PreTrainer(BaseTrainer):
         trainable = [name for name, param in self.model.named_parameters() if param.requires_grad]
         frozen = [name for name, param in self.model.named_parameters() if not param.requires_grad]
         self.logger.info(f"Text-only: Trainable parameters: {len(trainable)}, Frozen parameters: {len(frozen)}")
+        self.logger.info(f"Trainable parameter names: {trainable}")
    
     def training_settings_with_prompt(self):
         """Configure optimizer and scheduler for NER pre-training with visual prompts."""
@@ -462,7 +498,7 @@ class PreTrainer(BaseTrainer):
         # CRF, FC, and noise prediction layers
         params = {'lr': 5e-2, 'weight_decay': 1e-2, 'params': []}
         for name, param in self.model.named_parameters():
-            if 'crf' in name.lower() or name.lower().startswith('fc') or 'noise_pred' in name.lower() or 'label_mlp' in name.lower():
+            if 'crf' in name.lower() or name.lower().startswith('fc') or 'noise_pred' in name.lower():
                 params['params'].append(param)
         parameters.append(params)
 
@@ -473,11 +509,11 @@ class PreTrainer(BaseTrainer):
                 params['params'].append(param)
         parameters.append(params)
 
-        # Normalization and projection layers (time_mlp, char_lstm_mlp, char_projection, vt_projection, time_projection)
+        # Normalization and projection layers
         params = {'lr': self.args.lr, 'weight_decay': 1e-2, 'params': []}
         for name, param in self.model.named_parameters():
             if ('norm_' in name.lower() or 'time_mlp' in name.lower() or 'char_lstm_mlp' in name.lower() or 
-                'char_projection' in name.lower() or 'vt_projection' in name.lower() or 'time_projection' in name.lower()):
+                'char_projection' in name.lower() or 'vt_projection' in name.lower() or 'time_projection' in name.lower() or 'label_projection' in name.lower()):
                 params['params'].append(param)
         parameters.append(params)
 
@@ -485,6 +521,13 @@ class PreTrainer(BaseTrainer):
         params = {'lr': 1e-4, 'weight_decay': 5e-3, 'params': []}
         for name, param in self.model.named_parameters():
             if name.lower().startswith('char_lstm.') and 'char_lstm_mlp' not in name.lower():
+                params['params'].append(param)
+        parameters.append(params)
+
+        # LabelEncoder parameters (excluding label_projection)
+        params = {'lr': 1e-4, 'weight_decay': 5e-3, 'params': []}
+        for name, param in self.model.named_parameters():
+            if name.lower().startswith('label_encoder.') and 'label_projection' not in name.lower():
                 params['params'].append(param)
         parameters.append(params)
 

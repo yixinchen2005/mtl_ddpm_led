@@ -53,6 +53,10 @@ CLSTM_PATH = {
     'twitter15': 'char_lstm/twitter2015',
     'twitter17': 'char_lstm/twitter2017'
 }
+GNN_PATH = {
+    'twitter15': 'gnn/twitter2015',
+    'twitter17': 'gnn/twitter2017'
+}
 
 def set_seed(seed):
     """Set random seed for reproducibility."""
@@ -62,8 +66,8 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-def validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, clstm_path, use_prompt):
-    """Validate dataset and image paths."""
+def validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, clstm_path, gnn_path, use_prompt):
+    """Validate dataset, image, and model paths."""
     for key, path in data_path.items():
         if not os.path.exists(path):
             raise FileNotFoundError(f"Data path {path} for {key} does not exist")
@@ -74,6 +78,8 @@ def validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, clstm_pa
     for file in ["char_vocab.pkl", "char_lstm.pth"]:
         if not os.path.exists(os.path.join(clstm_path, file)):
             raise FileNotFoundError(f"{file} not found at {clstm_path}/{file}")
+    if not os.path.exists(os.path.join(gnn_path, "gnn_hetero_best_decoder.pth")):
+        raise FileNotFoundError(f"GNN weights not found at {gnn_path}/gnn_hetero_best_decoder.pth")
 
 def main():
     """Main function for NER diffusion model pretraining or finetuning."""
@@ -92,7 +98,7 @@ def main():
     parser.add_argument("--local_cache_path", default="./cache", type=str, help="Local HuggingFace model cache path.")
     parser.add_argument("--lm_name", default="vinai/bertweet-base", type=str, help="Pretrained language model.")
     parser.add_argument("--char_hidden_dim", default=64, type=int, help="Character-level LSTM hidden dimension.")
-    parser.add_argument('--label_hidden_dim', default=768, type=int, help="Label feature hidden dimension.")
+    parser.add_argument('--label_hidden_dim', default=768, type=int, help="Label feature input dimension for GNN.")
     parser.add_argument('--time_hidden_dim', default=32, type=int, help="Time embedding hidden dimension.")
     parser.add_argument('--embed_dim', default=128, type=int, help="Dimension for projected features.")
     parser.add_argument('--max_seq_len', default=80, type=int, help="Max sequence length.")
@@ -130,16 +136,17 @@ def main():
     if args.embed_dim < 1:
         raise ValueError("Embedding dimension must be positive.")
 
-    # Configure image paths
+    # Configure image and model paths
     imgs_path = IMG_PATH[args.dataset_name] if args.use_prompt else None
     aux_imgs_path = AUX_PATH[args.dataset_name] if args.use_prompt else None
     rcnn_imgs_path = RCNN_PATH[args.dataset_name] if args.use_prompt else None
-    logger.info("Using visual prompts: images enabled." if args.use_prompt else "No visual prompts: text-only encoding.")
     data_path = DATA_PATH[args.dataset_name]
     clstm_path = CLSTM_PATH[args.dataset_name]
+    gnn_path = GNN_PATH[args.dataset_name]
+    logger.info("Using visual prompts: images enabled." if args.use_prompt else "No visual prompts: text-only encoding.")
 
     # Validate paths
-    validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, clstm_path, args.use_prompt)
+    validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, clstm_path, gnn_path, args.use_prompt)
 
     # Define image transformations
     transform = transforms.Compose([
@@ -160,7 +167,7 @@ def main():
     label_mapping = processor.get_label_mapping()
     label_embeddings = processor.get_label_embedding().to(args.device)
     num_labels = len(label_mapping)
-    logger.info(f"Loaded {num_labels} labels from processor.")
+    logger.info(f"Loaded {num_labels} labels from processor, embeddings shape: {label_embeddings.shape}")
 
     # Load dataset
     logger.info(f"Loading {args.mode} dataset...")
@@ -219,7 +226,8 @@ def main():
     model = DiffusionModel(
         args=args,
         num_labels=num_labels,
-        label_embedding_table=label_embeddings,
+        label_embeddings=label_embeddings,
+        gnn_path=gnn_path,
         clstm_path=clstm_path,
         ner_model_name=args.ner_model_name
     ).to(args.device)
