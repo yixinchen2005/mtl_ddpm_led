@@ -49,10 +49,6 @@ RCNN_PATH = {
     'twitter15': 'data/NER_data/',
     'twitter17': 'data/NER_data/'
 }
-CLSTM_PATH = {
-    'twitter15': 'char_lstm/twitter2015',
-    'twitter17': 'char_lstm/twitter2017'
-}
 GNN_PATH = {
     'twitter15': 'gnn/twitter2015',
     'twitter17': 'gnn/twitter2017'
@@ -66,7 +62,7 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-def validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, clstm_path, gnn_path, use_prompt):
+def validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, gnn_path, use_prompt):
     """Validate dataset, image, and model paths."""
     for key, path in data_path.items():
         if not os.path.exists(path):
@@ -75,9 +71,6 @@ def validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, clstm_pa
         for path in [imgs_path, aux_imgs_path, rcnn_imgs_path]:
             if path and not os.path.exists(path):
                 raise FileNotFoundError(f"Image path {path} does not exist")
-    for file in ["char_vocab.pkl", "char_lstm.pth"]:
-        if not os.path.exists(os.path.join(clstm_path, file)):
-            raise FileNotFoundError(f"{file} not found at {clstm_path}/{file}")
     if not os.path.exists(os.path.join(gnn_path, "gnn_hetero_best_decoder.pth")):
         raise FileNotFoundError(f"GNN weights not found at {gnn_path}/gnn_hetero_best_decoder.pth")
 
@@ -91,24 +84,21 @@ def main():
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="Device: cuda or cpu.")
     parser.add_argument('--batch_size', default=8, type=int, help="Batch size.")
     parser.add_argument('--grad_accum_steps', default=2, type=int, help="Gradient accumulation steps.")
-    parser.add_argument('--lr', default=2e-5, type=float, help="Learning rate.")
     parser.add_argument('--warmup_ratio', default=0.01, type=float, help="Warmup ratio for scheduler.")
     parser.add_argument('--eval_begin_epoch', default=3, type=int, help="Epoch to start evaluation.")
     parser.add_argument('--seed', default=2021, type=int, help="Random seed.")
     parser.add_argument("--local_cache_path", default="./cache", type=str, help="Local HuggingFace model cache path.")
     parser.add_argument("--lm_name", default="vinai/bertweet-base", type=str, help="Pretrained language model.")
-    parser.add_argument("--char_hidden_dim", default=64, type=int, help="Character-level LSTM hidden dimension.")
-    parser.add_argument('--label_hidden_dim', default=768, type=int, help="Label feature input dimension for GNN.")
+    parser.add_argument('--label_hidden_dim', default=32, type=int, help="Label feature input dimension for GNN.")
     parser.add_argument('--time_hidden_dim', default=32, type=int, help="Time embedding hidden dimension.")
     parser.add_argument('--embed_dim', default=128, type=int, help="Dimension for projected features.")
     parser.add_argument('--max_seq_len', default=80, type=int, help="Max sequence length.")
-    parser.add_argument('--max_char_len', default=50, type=int, help="Max character length.")
-    parser.add_argument('--prompt_len', default=10, type=int, help="Prompt length for hvpnet.")
-    parser.add_argument('--prompt_dim', default=800, type=int, help="Prompt projection layer dimension for hvpnet.")
+    parser.add_argument('--use_prompt', action='store_true', help="Use visual prompts for HVPNet.")
+    parser.add_argument('--prompt_len', default=10, type=int, help="Prompt length for HVPNet.")
+    parser.add_argument('--prompt_dim', default=800, type=int, help="Prompt projection layer dimension for HVPNet.")
     parser.add_argument('--load_path', default=None, type=str, help="Path to load pretrained model.")
     parser.add_argument('--save_path', default="./models", type=str, help="Path to save models.")
     parser.add_argument('--notes', default="", type=str, help="Notes for save path directory.")
-    parser.add_argument('--use_prompt', action='store_true', help="Use visual prompts (images).")
     parser.add_argument('--aux_size', default=128, type=int, help="Auxiliary image size.")
     parser.add_argument('--rcnn_size', default=128, type=int, help="RCNN image size.")
     parser.add_argument('--train_steps', default=1000, type=int, help="Diffusion training timesteps.")
@@ -116,7 +106,8 @@ def main():
     parser.add_argument('--patience', default=5, type=int, help="Early stopping patience.")
     parser.add_argument('--noise_rate', default=0.1, type=float, help="Fraction of labels to corrupt during pretraining.")
     parser.add_argument("--mode", default="pretrain", type=str, choices=["pretrain", "finetune"], help="Training mode.")
-    parser.add_argument('--compute_eval_loss', action='store_true', help="Compute loss during validation and testing.")
+    parser.add_argument("--t_zero_prob", default=0.5, type=float, help="The probability of sampling t = 0 during training.")
+    parser.add_argument("--ce_weight", default=0.5,type=float, help="The weight of cross entropy loss.")
 
     args = parser.parse_args()
 
@@ -141,12 +132,11 @@ def main():
     aux_imgs_path = AUX_PATH[args.dataset_name] if args.use_prompt else None
     rcnn_imgs_path = RCNN_PATH[args.dataset_name] if args.use_prompt else None
     data_path = DATA_PATH[args.dataset_name]
-    clstm_path = CLSTM_PATH[args.dataset_name]
     gnn_path = GNN_PATH[args.dataset_name]
     logger.info("Using visual prompts: images enabled." if args.use_prompt else "No visual prompts: text-only encoding.")
 
     # Validate paths
-    validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, clstm_path, gnn_path, args.use_prompt)
+    validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, gnn_path, args.use_prompt)
 
     # Define image transformations
     transform = transforms.Compose([
@@ -158,12 +148,12 @@ def main():
     # Set random seed
     set_seed(args.seed)
     os.makedirs(args.save_path, exist_ok=True)
-    logdir = os.path.join("logs", f"{args.dataset_name}_bs{args.batch_size}_lr{args.lr}_ed{args.embed_dim}{args.notes}")
+    logdir = os.path.join("logs", f"{args.dataset_name}_bs{args.batch_size}_lr3e-5_ed{args.embed_dim}{args.notes}")
     os.makedirs(logdir, exist_ok=True)
 
     # Initialize LEDProcessor
     logger.info("Initializing LEDProcessor...")
-    processor = LEDProcessor(args, data_path=data_path, clstm_path=clstm_path)
+    processor = LEDProcessor(args, data_path=data_path)
     label_mapping = processor.get_label_mapping()
     label_embeddings = processor.get_label_embedding().to(args.device)
     num_labels = len(label_mapping)
@@ -176,25 +166,21 @@ def main():
         transform=transform,
         imgs_path=imgs_path,
         aux_imgs_path=aux_imgs_path,
+        rcnn_imgs_path=rcnn_imgs_path,
         max_seq_len=args.max_seq_len,
-        max_char_len=args.max_char_len,
         mode=args.mode,
         aux_size=args.aux_size,
-        rcnn_imgs_path=rcnn_imgs_path,
         rcnn_size=args.rcnn_size
     )
     if len(dataset) == 0:
         raise ValueError(f"{args.mode.capitalize()} dataset is empty.")
     logger.info(f"{args.mode.capitalize()} dataset size: {len(dataset)}")
 
-    # Check dataset sequence and token lengths
+    # Check dataset sequence length
     max_seq = max(len(sent) for sent in dataset.data_dict["words"])
-    max_char = max(len(token) for sent in dataset.data_dict["words"] for token in sent)
-    logger.info(f"Max sequence length: {max_seq}, Max token length: {max_char}")
+    logger.info(f"Max sequence length: {max_seq}")
     if max_seq > args.max_seq_len - 2:
         logger.warning(f"Some sequences will be truncated: max_seq={max_seq} > max_seq_len-2={args.max_seq_len-2}")
-    if max_char > args.max_char_len:
-        logger.warning(f"Some tokens will be truncated: max_char={max_char} > max_char_len={args.max_char_len}")
 
     # Split dataset (80/10/10)
     train_size = int(0.8 * len(dataset))
@@ -219,7 +205,7 @@ def main():
     metrics_file = os.path.join(logdir, "metrics.csv")
     with open(metrics_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'stage', 'batch', 'loss', 'mse_loss', 'crf_loss', 'ner_f1'])
+        writer.writerow(['epoch', 'stage', 'batch', 'loss', 'mse_loss', 'ce_loss', 'ner_f1'])
     logger.info(f"Logging metrics to {metrics_file}")
 
     # Initialize diffusion model
@@ -228,7 +214,6 @@ def main():
         num_labels=num_labels,
         label_embeddings=label_embeddings,
         gnn_path=gnn_path,
-        clstm_path=clstm_path,
         ner_model_name=args.ner_model_name
     ).to(args.device)
 

@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
 class LEDProcessor:
-    def __init__(self, args, data_path='data', clstm_path='clstm'):
+    def __init__(self, args, data_path='data'):
         """Initialize processor for LED dataset with BERT and CLIP models."""
         self.data_path = data_path
         self.args = args
@@ -19,11 +19,6 @@ class LEDProcessor:
         self.bert = BertModel.from_pretrained(
             os.path.join(self.args.local_cache_path, self.args.lm_name)
         )
-        try:
-            self.char2int, self.int2char = torch.load(os.path.join(clstm_path, "char_vocab.pkl"))
-        except FileNotFoundError:
-            logger.error(f"Char vocab file not found at {clstm_path}/char_vocab.pkl")
-            raise
         self.clip_processor = CLIPProcessor.from_pretrained(
             os.path.join(self.args.local_cache_path, self.args.vit_name)
         )
@@ -65,7 +60,6 @@ class LEDProcessor:
         def process_sentence():
             nonlocal words, targets_unk, targets_new, img_names, sentence_count
             if word and current_imgid is not None:
-                # Assert length equality
                 assert len(word) == len(target_unk), (
                     f"Length mismatch in IMGID:{current_imgid}: words={len(word)}, targets_unk={len(target_unk)}"
                 )
@@ -102,10 +96,6 @@ class LEDProcessor:
                         target_new.append(tokens[2])
                 else:  # Empty line indicates end of sentence
                     process_sentence()
-                    word, target_unk, target_new = [], [], []
-
-        # Process the final sentence
-        process_sentence()
 
         # Validate data lengths
         assert len(words) == len(targets_unk) == len(img_names), (
@@ -166,28 +156,26 @@ class LEDProcessor:
         return torch.stack(embeddings)
 
 class LEDDataset(Dataset):
-    def __init__(self, processor, transform, imgs_path=None, aux_imgs_path=None, max_seq_len=128, max_char_len=128, 
-                 mode="finetune", ignore_idx=0, aux_size=128, rcnn_imgs_path=None, rcnn_size=128):
+    def __init__(self, processor, transform, imgs_path, aux_imgs_path, rcnn_imgs_path, max_seq_len=128, mode="finetune", ignore_idx=0, aux_size=128, rcnn_size=128):
         super().__init__()
         self.transform = transform
         self.processor = processor
         self.imgs_path = imgs_path
         self.aux_imgs_path = aux_imgs_path
+        self.rcnn_imgs_path = rcnn_imgs_path
         self.max_seq_len = max_seq_len
-        self.max_char_len = max_char_len
         self.mode = mode
         self.ignore_idx = ignore_idx
         self.aux_size = aux_size
-        self.rcnn_imgs_path = rcnn_imgs_path
         self.rcnn_size = rcnn_size
         self.data_dict = None if mode == "subset" else processor.load_from_file(mode)
 
     def from_indices(self, indices):
         new_dataset = LEDDataset(
             processor=self.processor, transform=self.transform, imgs_path=self.imgs_path,
-            aux_imgs_path=self.aux_imgs_path, max_seq_len=self.max_seq_len, max_char_len=self.max_char_len,
-            mode="subset", ignore_idx=self.ignore_idx, aux_size=self.aux_size,
-            rcnn_imgs_path=self.rcnn_imgs_path, rcnn_size=self.rcnn_size
+            aux_imgs_path=self.aux_imgs_path, rcnn_imgs_path=self.rcnn_imgs_path,
+            max_seq_len=self.max_seq_len, mode="subset", ignore_idx=self.ignore_idx,
+            aux_size=self.aux_size, rcnn_size=self.rcnn_size
         )
         new_data_dict = {
             "aux_img_dict": self.data_dict.get("aux_img_dict", {}),
@@ -219,75 +207,42 @@ class LEDDataset(Dataset):
                 f"Length mismatch at index {idx} (IMGID:{img_name}): words={len(word_list)}, targets_new={len(targets_new_list)}"
             )
 
-        seq_data = self._seq_proc(word_list, targets_unk_list, targets_new_list)
-        token_input_ids, token_type_ids, token_attention_mask, char_input_ids, targets_unk, targets_new, words = seq_data
+        # Process sequence data
+        token_input_ids, token_type_ids, token_attention_mask, targets_unk, targets_new, words = self._seq_proc(word_list, targets_unk_list, targets_new_list)
 
-        image_data = self._img_proc(img_name) if self.imgs_path and self.processor.args.use_prompt else (None, None, None, None, None)
-        hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs = image_data
+        # Process images
+        hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs = self._img_proc(img_name)
 
-        if self.imgs_path and self.aux_imgs_path and self.rcnn_imgs_path and self.processor.args.use_prompt:
-            if self.mode == "finetune":
-                return (
-                    torch.tensor(targets_unk, dtype=torch.long),
-                    torch.tensor(targets_new, dtype=torch.long),
-                    torch.tensor(char_input_ids, dtype=torch.long),
-                    torch.tensor(token_input_ids, dtype=torch.long),
-                    torch.tensor(token_type_ids, dtype=torch.long),
-                    torch.tensor(token_attention_mask, dtype=torch.long),
-                    hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs, words, img_name
-                )
-            else:
-                return (
-                    torch.tensor(targets_unk, dtype=torch.long),
-                    torch.tensor(char_input_ids, dtype=torch.long),
-                    torch.tensor(token_input_ids, dtype=torch.long),
-                    torch.tensor(token_type_ids, dtype=torch.long),
-                    torch.tensor(token_attention_mask, dtype=torch.long),
-                    hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs, words, img_name
-                )
-        elif self.imgs_path and self.aux_imgs_path and self.processor.args.use_prompt:
-            if self.mode == "finetune":
-                return (
-                    torch.tensor(targets_unk, dtype=torch.long),
-                    torch.tensor(targets_new, dtype=torch.long),
-                    torch.tensor(char_input_ids, dtype=torch.long),
-                    torch.tensor(token_input_ids, dtype=torch.long),
-                    torch.tensor(token_type_ids, dtype=torch.long),
-                    torch.tensor(token_attention_mask, dtype=torch.long),
-                    hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, words, img_name
-                )
-            else:
-                return (
-                    torch.tensor(targets_unk, dtype=torch.long),
-                    torch.tensor(char_input_ids, dtype=torch.long),
-                    torch.tensor(token_input_ids, dtype=torch.long),
-                    torch.tensor(token_type_ids, dtype=torch.long),
-                    torch.tensor(token_attention_mask, dtype=torch.long),
-                    hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, words, img_name
-                )
+        if self.mode == "finetune":
+            return (
+                torch.tensor(targets_unk, dtype=torch.long),
+                torch.tensor(targets_new, dtype=torch.long),
+                torch.tensor(token_input_ids, dtype=torch.long),
+                torch.tensor(token_type_ids, dtype=torch.long),
+                torch.tensor(token_attention_mask, dtype=torch.long),
+                hvp_img,
+                hvp_aux_imgs,
+                mkg_img,
+                mkg_aux_imgs,
+                rcnn_imgs,
+                words
+            )
         else:
-            if self.mode == "finetune":
-                return (
-                    torch.tensor(targets_unk, dtype=torch.long),
-                    torch.tensor(targets_new, dtype=torch.long),
-                    torch.tensor(char_input_ids, dtype=torch.long),
-                    torch.tensor(token_input_ids, dtype=torch.long),
-                    torch.tensor(token_type_ids, dtype=torch.long),
-                    torch.tensor(token_attention_mask, dtype=torch.long),
-                    words, img_name
-                )
-            else:
-                return (
-                    torch.tensor(targets_unk, dtype=torch.long),
-                    torch.tensor(char_input_ids, dtype=torch.long),
-                    torch.tensor(token_input_ids, dtype=torch.long),
-                    torch.tensor(token_type_ids, dtype=torch.long),
-                    torch.tensor(token_attention_mask, dtype=torch.long),
-                    words, img_name
-                )
+            return (
+                torch.tensor(targets_unk, dtype=torch.long),
+                torch.tensor(token_input_ids, dtype=torch.long),
+                torch.tensor(token_type_ids, dtype=torch.long),
+                torch.tensor(token_attention_mask, dtype=torch.long),
+                hvp_img,
+                hvp_aux_imgs,
+                mkg_img,
+                mkg_aux_imgs,
+                rcnn_imgs,
+                words
+            )
 
     def _seq_proc(self, word_list, target_unk_list=None, target_new_list=None):
-        tokens, char_input_ids, targets_unk, targets_new, words = [], [], [], [], []
+        tokens, targets_unk, targets_new, words = [], [], [], []
         label_map = self.processor.get_label_mapping()
 
         # Validate input lengths
@@ -302,15 +257,6 @@ class LEDDataset(Dataset):
         for i, word in enumerate(word_list):
             token = self.processor.tokenizer.tokenize(word)
             tokens.extend(token)
-            char_ids = []
-            for t in token:
-                if t in self.processor.char2int:
-                    char_ids.append([self.processor.char2int[t]] + [0] * (self.max_char_len - 1))
-                else:
-                    char_ids.append([self.processor.char2int.get(c, 0) for c in t[:self.max_char_len]] + 
-                                    [0] * (self.max_char_len - len(t)))
-            char_input_ids.extend(char_ids)
-            
             target_unk = target_unk_list[i]
             for m in range(len(token)):
                 targets_unk.append(label_map[target_unk] if m == 0 else label_map["X"])
@@ -322,7 +268,6 @@ class LEDDataset(Dataset):
 
         if len(tokens) >= self.max_seq_len - 2:
             tokens = tokens[:self.max_seq_len - 2]
-            char_input_ids = char_input_ids[:self.max_seq_len - 2]
             words = words[:self.max_seq_len - 2]
             targets_unk = targets_unk[:self.max_seq_len - 2]
             if target_new_list:
@@ -335,10 +280,6 @@ class LEDDataset(Dataset):
         token_type_ids = token_encode_dict["token_type_ids"]
         token_attention_mask = token_encode_dict["attention_mask"]
 
-        char_input_ids = ([[self.processor.char2int["[CLS]"]] + [0] * (self.max_char_len - 1)] + 
-                          char_input_ids + 
-                          [[self.processor.char2int["[SEP]"]] + [0] * (self.max_char_len - 1)] + 
-                          [[self.processor.char2int["[PAD]"]] * self.max_char_len] * (self.max_seq_len - len(char_input_ids) - 2))
         targets_unk = [label_map["[CLS]"]] + targets_unk + [label_map["[SEP]"]] + [self.ignore_idx] * (self.max_seq_len - len(targets_unk) - 2)
         if target_new_list:
             targets_new = [label_map["[CLS]"]] + targets_new + [label_map["[SEP]"]] + [self.ignore_idx] * (self.max_seq_len - len(targets_new) - 2)
@@ -354,12 +295,6 @@ class LEDDataset(Dataset):
         assert len(token_attention_mask) == self.max_seq_len, (
             f"Token attention_mask length mismatch: {len(token_attention_mask)}, expected={self.max_seq_len}"
         )
-        assert len(char_input_ids) == self.max_seq_len, (
-            f"Char input_ids length mismatch: {len(char_input_ids)}, expected={self.max_seq_len}"
-        )
-        assert all(len(c) == self.max_char_len for c in char_input_ids), (
-            f"Char input sub-length mismatch: {[len(c) for c in char_input_ids]}, expected={self.max_char_len}"
-        )
         assert len(targets_unk) == self.max_seq_len, (
             f"Targets_unk length mismatch: {len(targets_unk)}, expected={self.max_seq_len}"
         )
@@ -371,95 +306,78 @@ class LEDDataset(Dataset):
             f"Words length mismatch: {len(words)}, expected={self.max_seq_len}"
         )
 
-        return token_input_ids, token_type_ids, token_attention_mask, char_input_ids, targets_unk, targets_new, words
+        return token_input_ids, token_type_ids, token_attention_mask, targets_unk, targets_new, words
 
     def _img_proc(self, img_name):
-        hvp_img = mkg_img = hvp_aux_imgs = mkg_aux_imgs = rcnn_imgs = None
+        hvp_img = torch.zeros(3, 224, 224)
+        mkg_img = torch.zeros(3, 224, 224)
+        hvp_aux_imgs = torch.zeros(3, 3, self.aux_size, self.aux_size)
+        mkg_aux_imgs = torch.zeros(3, 3, self.aux_size, self.aux_size)
+        rcnn_imgs = torch.zeros(3, 3, self.rcnn_size, self.rcnn_size)
         missing_images = 0
-        
-        if self.imgs_path is None:
-            return hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs
-        
-        if self.imgs_path:
-            img_path = os.path.join(self.imgs_path, img_name)
-            try:
-                image = Image.open(img_path).convert("RGB")
-                if image.size[0] < 10 or image.size[1] < 10:
-                    logger.debug(f"Image {img_path} too small (size: {image.size}), using placeholder")
-                    image = Image.new("RGB", (224, 224), color="white")
-                    missing_images += 1
-                hvp_img = self.transform(image) if self.transform else torch.zeros(3, 224, 224)
-                mkg_img = self.processor.clip_processor(images=image, return_tensors='pt')['pixel_values'].squeeze()
-                logger.debug(f"Processed main image {img_path}, size: {image.size}, hvp_img shape: {hvp_img.shape if hvp_img is not None else 'None'}, mkg_img shape: {mkg_img.shape if mkg_img is not None else 'None'}")
-            except (FileNotFoundError, OSError) as e:
-                logger.warning(f"Image {img_path} not found or invalid ({str(e)}), using placeholder")
+
+        # Process main image
+        img_path = os.path.join(self.imgs_path, img_name)
+        try:
+            image = Image.open(img_path).convert("RGB")
+            if image.size[0] < 10 or image.size[1] < 10:
+                logger.debug(f"Image {img_path} too small (size: {image.size}), using placeholder")
                 image = Image.new("RGB", (224, 224), color="white")
                 missing_images += 1
-                hvp_img = torch.zeros(3, 224, 224)
-                mkg_img = torch.zeros(3, 224, 224)
+            hvp_img = self.transform(image) if self.transform else self.processor.clip_processor(images=image, return_tensors='pt')['pixel_values'].squeeze()
+            mkg_img = self.processor.clip_processor(images=image, return_tensors='pt')['pixel_values'].squeeze()
+        except (FileNotFoundError, OSError) as e:
+            logger.warning(f"Image {img_path} not found or invalid ({str(e)}), using placeholder")
+            missing_images += 1
 
-            if self.aux_imgs_path:
-                hvp_aux_imgs, mkg_aux_imgs = [], []
-                aux_img_paths = self.data_dict.get("aux_img_dict", {}).get(img_name, [])
-                aux_img_paths = [os.path.join(self.aux_imgs_path, path) for path in aux_img_paths[:3]]
-                
-                for path in aux_img_paths:
-                    try:
-                        aux_img = Image.open(path).convert("RGB")
-                        if aux_img.size[0] < 10 or aux_img.size[1] < 10:
-                            logger.debug(f"Aux image {path} too small (size: {aux_img.size}), using placeholder")
-                            aux_img = Image.new("RGB", (self.aux_size, self.aux_size), color="white")
-                            missing_images += 1
-                        hvp_aux_imgs.append(self.processor.aux_processor(images=aux_img, return_tensors='pt')['pixel_values'].squeeze())
-                        mkg_aux_imgs.append(self.processor.aux_processor(images=aux_img, return_tensors='pt')['pixel_values'].squeeze())
-                        logger.debug(f"Processed aux image {path}, size: {aux_img.size}, hvp_aux_img shape: {hvp_aux_imgs[-1].shape}, mkg_aux_img shape: {mkg_aux_imgs[-1].shape}")
-                    except (FileNotFoundError, OSError) as e:
-                        logger.warning(f"Aux image {path} not found or invalid ({str(e)}), using placeholder")
-                        hvp_aux_imgs.append(torch.zeros(3, self.aux_size, self.aux_size))
-                        mkg_aux_imgs.append(torch.zeros(3, self.aux_size, self.aux_size))
-                        missing_images += 1
-                
-                while len(hvp_aux_imgs) < 3:
-                    hvp_aux_imgs.append(torch.zeros(3, self.aux_size, self.aux_size))
-                    mkg_aux_imgs.append(torch.zeros(3, self.aux_size, self.aux_size))
-                    logger.debug(f"Added placeholder aux image, shape: [3, {self.aux_size}, {self.aux_size}]")
-                
-                hvp_aux_imgs = torch.stack(hvp_aux_imgs)
-                mkg_aux_imgs = torch.stack(mkg_aux_imgs)
+        # Process auxiliary images
+        aux_img_paths = self.data_dict.get("aux_img_dict", {}).get(img_name, [])[:3]
+        aux_img_paths = [os.path.join(self.aux_imgs_path, path) for path in aux_img_paths]
+        hvp_aux_imgs_list, mkg_aux_imgs_list = [], []
+        for path in aux_img_paths:
+            try:
+                aux_img = Image.open(path).convert("RGB")
+                if aux_img.size[0] < 10 or aux_img.size[1] < 10:
+                    logger.debug(f"Aux image {path} too small (size: {aux_img.size}), using placeholder")
+                    aux_img = Image.new("RGB", (self.aux_size, self.aux_size), color="white")
+                    missing_images += 1
+                hvp_aux_imgs_list.append(self.processor.aux_processor(images=aux_img, return_tensors='pt')['pixel_values'].squeeze())
+                mkg_aux_imgs_list.append(self.processor.aux_processor(images=aux_img, return_tensors='pt')['pixel_values'].squeeze())
+            except (FileNotFoundError, OSError) as e:
+                logger.warning(f"Aux image {path} not found or invalid ({str(e)}), using placeholder")
+                hvp_aux_imgs_list.append(torch.zeros(3, self.aux_size, self.aux_size))
+                mkg_aux_imgs_list.append(torch.zeros(3, self.aux_size, self.aux_size))
+                missing_images += 1
+        
+        while len(hvp_aux_imgs_list) < 3:
+            hvp_aux_imgs_list.append(torch.zeros(3, self.aux_size, self.aux_size))
+            mkg_aux_imgs_list.append(torch.zeros(3, self.aux_size, self.aux_size))
+        hvp_aux_imgs = torch.stack(hvp_aux_imgs_list)
+        mkg_aux_imgs = torch.stack(mkg_aux_imgs_list)
 
-            if self.rcnn_imgs_path and self.data_dict.get("rcnn_img_dict"):
-                rcnn_imgs = []
-                img_key = img_name.split('.')[0]
-                rcnn_img_paths = self.data_dict.get("rcnn_img_dict", {}).get(img_key, [])
-                rcnn_img_paths = [os.path.join(self.rcnn_imgs_path, path) for path in rcnn_img_paths[:3]]
-                
-                for path in rcnn_img_paths:
-                    try:
-                        rcnn_img = Image.open(path).convert("RGB")
-                        if rcnn_img.size[0] < 10 or rcnn_img.size[1] < 10:
-                            logger.debug(f"RCNN image {path} too small (size: {rcnn_img.size}), using placeholder")
-                            rcnn_img = Image.new("RGB", (self.rcnn_size, self.rcnn_size), color="white")
-                            missing_images += 1
-                        rcnn_imgs.append(self.processor.rcnn_processor(images=rcnn_img, return_tensors='pt')['pixel_values'].squeeze())
-                        logger.debug(f"Processed RCNN image {path}, size: {rcnn_img.size}, rcnn_img shape: {rcnn_imgs[-1].shape}")
-                    except (FileNotFoundError, OSError) as e:
-                        logger.warning(f"RCNN image {path} not found or invalid ({str(e)}), using placeholder")
-                        rcnn_imgs.append(torch.zeros(3, self.rcnn_size, self.rcnn_size))
-                        missing_images += 1
-                
-                while len(rcnn_imgs) < 3:
-                    rcnn_imgs.append(torch.zeros(3, self.rcnn_size, self.rcnn_size))
-                    logger.debug(f"Added placeholder RCNN image, shape: [3, {self.rcnn_size}, {self.rcnn_size}]")
-                
-                rcnn_imgs = torch.stack(rcnn_imgs)
+        # Process RCNN images
+        img_key = img_name.split('.')[0]
+        rcnn_img_paths = self.data_dict.get("rcnn_img_dict", {}).get(img_key, [])[:3]
+        rcnn_img_paths = [os.path.join(self.rcnn_imgs_path, path) for path in rcnn_img_paths]
+        rcnn_imgs_list = []
+        for path in rcnn_img_paths:
+            try:
+                rcnn_img = Image.open(path).convert("RGB")
+                if rcnn_img.size[0] < 10 or rcnn_img.size[1] < 10:
+                    logger.debug(f"RCNN image {path} too small (size: {rcnn_img.size}), using placeholder")
+                    rcnn_img = Image.new("RGB", (self.rcnn_size, self.rcnn_size), color="white")
+                    missing_images += 1
+                rcnn_imgs_list.append(self.processor.rcnn_processor(images=rcnn_img, return_tensors='pt')['pixel_values'].squeeze())
+            except (FileNotFoundError, OSError) as e:
+                logger.warning(f"RCNN image {path} not found or invalid ({str(e)}), using placeholder")
+                rcnn_imgs_list.append(torch.zeros(3, self.rcnn_size, self.rcnn_size))
+                missing_images += 1
+        
+        while len(rcnn_imgs_list) < 3:
+            rcnn_imgs_list.append(torch.zeros(3, self.rcnn_size, self.rcnn_size))
+        rcnn_imgs = torch.stack(rcnn_imgs_list)
 
-            if missing_images > 0:
-                logger.info(f"Processed {img_name} with {missing_images} missing or invalid images")
+        if missing_images > 0:
+            logger.info(f"Processed {img_name} with {missing_images} missing or invalid images")
 
-            return (
-                hvp_img if hvp_img is not None else torch.zeros(3, 224, 224),
-                hvp_aux_imgs if hvp_aux_imgs is not None else torch.zeros(3, 3, self.aux_size, self.aux_size),
-                mkg_img if mkg_img is not None else torch.zeros(3, 224, 224),
-                mkg_aux_imgs if mkg_aux_imgs is not None else torch.zeros(3, 3, self.aux_size, self.aux_size),
-                rcnn_imgs if rcnn_imgs is not None else torch.zeros(3, 3, self.rcnn_size, self.rcnn_size)
-            )
+        return hvp_img, hvp_aux_imgs, mkg_img, mkg_aux_imgs, rcnn_imgs
