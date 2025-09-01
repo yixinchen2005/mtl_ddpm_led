@@ -11,8 +11,11 @@ from torchvision import transforms
 import random
 import csv
 from processor.dataset import LEDProcessor, LEDDataset
-from models.mtl_ddpm_model import DiffusionModel
-from modules.ddpm_train import PreTrainer
+from models.mtl_ddim_model import DiffusionModel
+from modules.ddim_train import PreTrainer
+from models.gnn_model import HeteroLabelEmbeddingGNN
+from models.bert_model import HMNeTNERModel
+from models.unimo_model import UnimoCRFModel
 
 # Configure logging
 logging.basicConfig(
@@ -89,7 +92,7 @@ def main():
     parser.add_argument('--seed', default=2021, type=int, help="Random seed.")
     parser.add_argument("--local_cache_path", default="./cache", type=str, help="Local HuggingFace model cache path.")
     parser.add_argument("--lm_name", default="vinai/bertweet-base", type=str, help="Pretrained language model.")
-    parser.add_argument('--label_hidden_dim', default=32, type=int, help="Label feature input dimension for GNN.")
+    parser.add_argument('--label_hidden_dim', default=128, type=int, help="Label feature input dimension for GNN.")
     parser.add_argument('--time_hidden_dim', default=32, type=int, help="Time embedding hidden dimension.")
     parser.add_argument('--embed_dim', default=128, type=int, help="Dimension for projected features.")
     parser.add_argument('--max_seq_len', default=80, type=int, help="Max sequence length.")
@@ -104,10 +107,12 @@ def main():
     parser.add_argument('--train_steps', default=1000, type=int, help="Diffusion training timesteps.")
     parser.add_argument('--reverse_steps', default=10, type=int, help="Diffusion inference timesteps.")
     parser.add_argument('--patience', default=5, type=int, help="Early stopping patience.")
-    parser.add_argument('--noise_rate', default=0.1, type=float, help="Fraction of labels to corrupt during pretraining.")
+    parser.add_argument('--noise_scale', default=0.5, type=float, help="Gaussian noise scale for diffusion.")
     parser.add_argument("--mode", default="pretrain", type=str, choices=["pretrain", "finetune"], help="Training mode.")
-    parser.add_argument("--t_zero_prob", default=0.5, type=float, help="The probability of sampling t = 0 during training.")
-    parser.add_argument("--ce_weight", default=0.5,type=float, help="The weight of cross entropy loss.")
+    parser.add_argument("--t_zero_prob", default=0.3, type=float, help="The probability of sampling t = 0 during training.")
+    parser.add_argument("--ce_weight", default=0.5, type=float, help="The weight of cross entropy loss.")
+    parser.add_argument("--ce_decay_k", default=5.0, type=float, help="Decay constant for CE loss exponential decay.")
+    parser.add_argument("--post_process", action='store_true', help="Apply post-processing in reverse_diffusion.")
 
     args = parser.parse_args()
 
@@ -122,8 +127,8 @@ def main():
         raise ValueError("Gradient accumulation steps must be positive.")
     if args.load_path and not os.path.exists(args.load_path):
         raise ValueError(f"Load path {args.load_path} does not exist.")
-    if args.noise_rate <= 0 or args.noise_rate >= 1:
-        raise ValueError("Noise rate must be between 0 and 1.")
+    if args.noise_scale <= 0:
+        raise ValueError("Noise scale must be positive.")
     if args.embed_dim < 1:
         raise ValueError("Embedding dimension must be positive.")
 
@@ -205,19 +210,45 @@ def main():
     metrics_file = os.path.join(logdir, "metrics.csv")
     with open(metrics_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'stage', 'batch', 'loss', 'mse_loss', 'ce_loss', 'ner_f1'])
+        writer.writerow(['epoch', 'stage', 'batch', 'ner_f1', 'mse_loss', 'ce_loss'])
     logger.info(f"Logging metrics to {metrics_file}")
+
+    # Label encoder (pre-trained GNN, fine-tuned)
+    label_encoder = HeteroLabelEmbeddingGNN(
+        label_embeddings=label_embeddings, 
+        hidden_dim=args.label_hidden_dim,
+        num_labels=num_labels
+    ).to(args.device)
+    if gnn_path:
+        logger.info(f"Loading GNN weights from {os.path.join(gnn_path, 'gnn_hetero_best_decoder.pth')}")
+        label_encoder.load_state_dict(torch.load(os.path.join(gnn_path, "gnn_hetero_best_decoder.pth")))
+
+    # Visual-textual encoder
+    if args.ner_model_name == "hvpnet":
+        ner_model = HMNeTNERModel(num_labels, args)
+        vt_encoder = ner_model.core
+        vt_hidden_size = vt_encoder.bert.config.hidden_size
+    elif args.ner_model_name == "mkgformer":
+        ner_model = UnimoCRFModel(num_labels, args)
+        vt_encoder = ner_model.model
+        vt_hidden_size = vt_encoder.text_config.hidden_size
+    else:
+        raise ValueError("Invalid ner_model_name")
+    vt_encoder = vt_encoder.to(args.device)
+    if getattr(args, 'ner_pretrained_path', None):
+        logger.info(f"Loading NER encoder weights from {args.ner_pretrained_path}")
+        vt_encoder.load_state_dict(torch.load(args.ner_pretrained_path))
 
     # Initialize diffusion model
     model = DiffusionModel(
         args=args,
         num_labels=num_labels,
-        label_embeddings=label_embeddings,
-        gnn_path=gnn_path,
-        ner_model_name=args.ner_model_name
+        label_encoder=label_encoder,
+        vt_encoder=vt_encoder,
+        vt_hidden_size=vt_hidden_size
     ).to(args.device)
 
-    # Load pretrained model if specified
+    # Load pretrained model if specified{sentence_count}
     if args.load_path:
         logger.info(f"Loading model from {args.load_path}")
         model.load_state_dict(torch.load(args.load_path))

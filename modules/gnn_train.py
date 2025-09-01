@@ -271,10 +271,12 @@ if __name__ == "__main__":
     parser.add_argument("--metrics_file", type=str, default="metrics.csv", help="File to save metrics")
     parser.add_argument("--refresh_step", type=int, default=2, help="Steps to update progress bar")
     parser.add_argument("--clean_weight", type=float, default=0.5, help="Weight for clean loss in decoder_loss")
+    parser.add_argument("--hidden_dim", type=int, default=128, help="The dimension of embeddngs.")
+    parser.add_argument('--max_seq_len', default=80, type=int, help="Max sequence length.")
     args = parser.parse_args()
     logger.info("Initializing GNNProcessor and GNNDataset...")
     processor = GNNProcessor(args)
-    dataset = GNNDataset(processor, max_seq_len=128)
+    dataset = GNNDataset(processor)
     indices = list(range(len(dataset)))
     train_indices, temp_indices = train_test_split(indices, test_size=0.2, random_state=42)
     val_indices, test_indices = train_test_split(temp_indices, test_size=0.5, random_state=42)
@@ -285,7 +287,7 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=custom_collate_fn, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=custom_collate_fn, num_workers=0)
     logger.info("Initializing Heterogeneous GNN model...")
-    model = HeteroLabelEmbeddingGNN(label_embeddings=processor.label_embeddings, hidden_dim=32, num_labels=len(processor.get_label_mapping()))
+    model = HeteroLabelEmbeddingGNN(label_embeddings=processor.label_embeddings, hidden_dim=args.hidden_dim, num_labels=len(processor.get_label_mapping()))
     logger.info("Training Heterogeneous GNN with decoder loss...")
     trainer = GNNPreTrainer(
         train_data=train_loader,
