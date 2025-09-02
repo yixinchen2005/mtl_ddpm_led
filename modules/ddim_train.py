@@ -116,6 +116,10 @@ class PreTrainer(BaseTrainer):
             if self.args.ner_model_name == 'hvpnet' and 'vt_encoder.image_model' in name.lower():
                 param.requires_grad = False
 
+        for name, param in self.model.named_parameters():
+            if name.lower().startswith('label_encoder'):
+                param.requires_grad = False
+
         # Verify no parameter overlap
         param_ids = []
         for group in parameters:
@@ -178,20 +182,20 @@ class PreTrainer(BaseTrainer):
                     )
                     if loss is not None:
                         loss = loss / self.args.grad_accum_steps
-                        loss.backward()
-                        if self.step % self.args.grad_accum_steps == 0:
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                            self.optimizer.step()
-                            self.scheduler.step()
-                            self.optimizer.zero_grad()
-
-                        batch_loss = loss.detach().cpu().item() * self.args.grad_accum_steps
                         # loss.backward()
-                        # torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                        # self.optimizer.step()
-                        # self.scheduler.step()
-                        # self.optimizer.zero_grad()
-                        # batch_loss = loss.detach().cpu().item()
+                        # if self.step % self.args.grad_accum_steps == 0:
+                        #     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        #     self.optimizer.step()
+                        #     self.scheduler.step()
+                        #     self.optimizer.zero_grad()
+
+                        # batch_loss = loss.detach().cpu().item() * self.args.grad_accum_steps
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        self.optimizer.zero_grad()
+                        batch_loss = loss.detach().cpu().item()
 
                         batch_mse_loss = self.model.mse_loss.item() if self.model.mse_loss is not None else 0.0
                         batch_ce_loss = self.model.ce_loss.item() if self.model.ce_loss is not None else 0.0

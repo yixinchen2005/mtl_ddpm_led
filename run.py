@@ -104,7 +104,7 @@ def main():
     parser.add_argument('--notes', default="", type=str, help="Notes for save path directory.")
     parser.add_argument('--aux_size', default=128, type=int, help="Auxiliary image size.")
     parser.add_argument('--rcnn_size', default=128, type=int, help="RCNN image size.")
-    parser.add_argument('--train_steps', default=1000, type=int, help="Diffusion training timesteps.")
+    parser.add_argument('--train_steps', default=50, type=int, help="Diffusion training timesteps.")
     parser.add_argument('--reverse_steps', default=10, type=int, help="Diffusion inference timesteps.")
     parser.add_argument('--patience', default=5, type=int, help="Early stopping patience.")
     parser.add_argument('--noise_scale', default=0.5, type=float, help="Gaussian noise scale for diffusion.")
