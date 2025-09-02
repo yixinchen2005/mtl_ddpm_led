@@ -153,28 +153,6 @@ class DiffusionModel(nn.Module):
         # Use GNN decoder for label reconstruction
         self.decoder = self.label_encoder.decoder
 
-    def get_label_embedding(self, labels, attention_mask):
-        """Convert label indices to embeddings with GNN and self-attention."""
-        assert labels is not None, "labels required"
-        assert attention_mask is not None, "attention_mask required"
-        labels = labels.to(self.args.device)
-        if labels.max() >= self.num_labels:
-            logger.warning(f"Label indices out of range: max={labels.max().item()}, num_labels={self.num_labels}")
-        
-        _, sequence_embeddings, _ = self.label_encoder(edge_index_dict=None, label_indices=labels)
-        label_features = sequence_embeddings  # No label_proj, as dimensions match
-        label_features = self.label_norm(label_features / torch.norm(label_features, dim=-1, keepdim=True).clamp(min=1e-5))
-        label_mask = attention_mask.bool()
-        
-        for self_attn in self.label_self_attn:
-            label_features = self_attn(
-                query=label_features, key=label_features, value=label_features, 
-                mask=label_mask
-            )
-            label_features = self.label_self_attn_dropout(label_features)
-        
-        return label_features, sequence_embeddings
-
     def get_context_embedding(self, input_ids, attention_mask, token_type_ids=None, 
                              images=None, aux_imgs=None, rcnn_imgs=None):
         """Generate embeddings for visual-textual input."""
@@ -209,9 +187,15 @@ class DiffusionModel(nn.Module):
 
     def corrupt(self, t, labels, attention_mask):
         """Corrupt labels with diffusion noise."""
-        label_features, clean_embeddings = self.get_label_embedding(labels, attention_mask)
-        corrupt_label_embeddings, _ = self.noise_scheduler.add_noise(label_features, t, attention_mask)
-        return corrupt_label_embeddings, clean_embeddings
+        assert labels is not None, "labels required"
+        assert attention_mask is not None, "attention_mask required"
+        labels = labels.to(self.args.device)
+        if labels.max() >= self.num_labels:
+            logger.warning(f"Label indices out of range: max={labels.max().item()}, num_labels={self.num_labels}")
+        
+        _, clean_embeddings, _ = self.label_encoder(edge_index_dict=None, label_indices=labels)
+        corrupt_embeddings, _ = self.noise_scheduler.add_noise(clean_embeddings, t, attention_mask)
+        return corrupt_embeddings, clean_embeddings
 
     def denoise(self, corrupt_label_embeddings, t, input_ids, attention_mask, 
                 token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None):
@@ -223,7 +207,18 @@ class DiffusionModel(nn.Module):
         vt_features = self.context_film(vt_features, time_features)
         
         label_features = corrupt_label_embeddings
+        label_features = self.label_norm(label_features / torch.norm(label_features, dim=-1, keepdim=True).clamp(min=1e-5))
         attn_mask = attention_mask.bool()
+        
+        # Self-attention #
+        for self_attn in self.label_self_attn:
+            label_features = self_attn(
+                query=label_features, key=label_features, value=label_features, 
+                mask=attn_mask
+            )
+            label_features = self.label_self_attn_dropout(label_features)
+
+        # Cross-attention #
         for attn in self.label_vt_attn:
             label_features = attn(
                 query=label_features, key=vt_features, value=vt_features, 
@@ -281,7 +276,8 @@ class DiffusionModel(nn.Module):
         # Combine losses
         k = getattr(self.args, 'ce_decay_k', 5.0)
         ce_weight = self.args.ce_weight * torch.exp(-k * (self.t_random / self.args.train_steps)).mean()
-        loss = mse_loss + ce_weight * ce_loss
+        # loss = mse_loss + ce_weight * ce_loss
+        loss = mse_loss + ce_loss
 
         # Logging
         if torch.isnan(loss) or torch.isinf(loss):
