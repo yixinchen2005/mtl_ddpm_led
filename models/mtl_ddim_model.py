@@ -10,53 +10,109 @@ logger = logging.getLogger(__name__)
 
 class DDIMScheduler:
     def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02, device="cpu", schedule_type="cosine"):
-        """Initialize DDIM scheduler with cosine schedule."""
         self.timesteps = timesteps
         self.device = device
         assert 0 < beta_start < beta_end < 1, "Invalid beta range"
-        
         if schedule_type == "cosine":
             t = torch.linspace(0, 1, timesteps + 1, device=device)[:-1]
             self.beta = 1 - torch.cos(t * torch.pi / 2) ** 2
             self.beta = self.beta * (beta_end - beta_start) + beta_start
         else:
             self.beta = torch.linspace(beta_start, beta_end, timesteps, device=device, dtype=torch.float32)
-            
         self.alpha = 1 - self.beta
-        self.alpha_bar = torch.cumprod(self.alpha, dim=0)
+        self.alpha_bar = torch.cumprod(self.alpha, dim=0)   # shape [timesteps]
         self.noise_scale = 1.0
+        print("alpha_bar_T:", self.alpha_bar[-1].item())
 
     def set_noise_scale(self, scale):
-        """Set the scale for noise addition."""
         self.noise_scale = scale
 
     def add_noise(self, x, t, attention_mask=None):
-        """Add noise to input embeddings at timestep t, respecting attention mask."""
-        assert t.max() < self.timesteps and t.min() >= 0, f"Invalid timestep: t={t}"
+        """
+        x: [B, L, D]
+        t: LongTensor shape [B] with values in [0, timesteps-1]
+        returns noisy_x, eps (noise)
+        """
+        assert t.max().item() < self.timesteps and t.min().item() >= 0, f"Invalid timestep: t={t}"
         noise = torch.randn_like(x) * self.noise_scale
-        signal_rate_t = self.alpha_bar[t].sqrt().view(-1, 1, 1)
-        noise_rate_t = (1 - self.alpha_bar[t]).sqrt().view(-1, 1, 1)
+        # gather alpha_bar[t] (shape [B]) then view for broadcast
+        alpha_bar_t = self.alpha_bar[t].view(-1, 1, 1)
+        signal_rate_t = torch.sqrt(alpha_bar_t)
+        noise_rate_t = torch.sqrt(torch.clamp(1.0 - alpha_bar_t, min=0.0))
         noisy_x = signal_rate_t * x + noise_rate_t * noise
         if attention_mask is not None:
             mask = attention_mask.unsqueeze(-1).float()
-            noisy_x = mask * noisy_x + (1 - mask) * x
+            noisy_x = mask * noisy_x + (1.0 - mask) * x
         return noisy_x, noise
-    
-    def step(self, pred_clean, t, noisy_x, eta=0.0):
-        """Perform a DDIM denoising step."""
-        assert t.max() < self.timesteps and t.min() >= 0, f"Invalid timestep: t={t}"
-        alpha_bar_t = self.alpha_bar[t].view(-1, 1, 1)
-        alpha_bar_t_prev = self.alpha_bar[t-1].view(-1, 1, 1) if (t-1).min() >= 0 else torch.ones_like(alpha_bar_t)
-        
-        sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev))
-        noise_denom = torch.sqrt(1 - alpha_bar_t)
-        noise_denom = torch.where(noise_denom == 0, torch.ones_like(noise_denom) * 1e-5, noise_denom)
-        eps = (noisy_x - torch.sqrt(alpha_bar_t) * pred_clean) / noise_denom
-        
-        x = (torch.sqrt(alpha_bar_t_prev) * pred_clean + 
-             torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps + 
-             sigma_t * torch.randn_like(noisy_x))
-        return x
+
+    def step(self, pred_clean, t, noisy_x, t_prev=None, eta=0.0, attention_mask=None):
+        """
+        Perform a DDIM step from t -> t_prev.
+        - pred_clean: predicted x0 (x_0) by the denoiser, shape [B, L, D]
+        - t: LongTensor [B] current timestep indices
+        - noisy_x: x_t, shape [B, L, D]
+        - t_prev: either None (interpreted as t-1) or LongTensor/iterable with previous timestep indices per sample.
+                  If value < 0 -> treat alpha_bar_prev = 1.0 (i.e. x0).
+        - eta: DDIM noise parameter
+        """
+        # Basic validations
+        assert t.max().item() < self.timesteps and t.min().item() >= 0, f"Invalid t"
+        B = t.size(0)
+
+        # Prepare t_prev tensor
+        if t_prev is None:
+            # default: t - 1 (clamped at 0)
+            t_prev_tensor = (t - 1).clamp(min=0)
+            # but mark samples where original t == 0 as -1 to indicate alpha_bar_prev == 1.0
+            t_prev_mask = (t > 0)
+            t_prev_tensor = torch.where(t_prev_mask, t_prev_tensor, torch.full_like(t_prev_tensor, -1))
+        else:
+            # accept scalar or tensor
+            if isinstance(t_prev, int):
+                t_prev_tensor = torch.full_like(t, t_prev)
+            elif isinstance(t_prev, torch.Tensor):
+                t_prev_tensor = t_prev.to(t.device)
+            else:
+                # try to build tensor from iterable
+                t_prev_tensor = torch.tensor(t_prev, device=t.device, dtype=torch.long)
+                if t_prev_tensor.dim() == 0:
+                    t_prev_tensor = torch.full_like(t, int(t_prev))
+
+        # Gather alpha_bar for t and t_prev safely
+        alpha_bar_t = self.alpha_bar[t].view(-1, 1, 1)                    # [B,1,1]
+        # for t_prev < 0 -> alpha_bar_prev = 1.0
+        prev_valid_mask = (t_prev_tensor >= 0)
+        alpha_bar_prev = torch.ones_like(alpha_bar_t)
+        if prev_valid_mask.any():
+            # gather only for valid indices
+            idxs = t_prev_tensor.clamp(min=0)
+            alpha_bar_prev_vals = self.alpha_bar[idxs].view(-1, 1, 1)
+            alpha_bar_prev = torch.where(prev_valid_mask.view(-1,1,1), alpha_bar_prev_vals, alpha_bar_prev)
+
+        # compute eps (noise estimate) using stable denom
+        denom = torch.sqrt(torch.clamp(1.0 - alpha_bar_t, min=1e-12))
+        eps = (noisy_x - torch.sqrt(alpha_bar_t) * pred_clean) / denom
+
+        if eta == 0.0:
+            x_prev = torch.sqrt(alpha_bar_prev) * pred_clean + torch.sqrt(torch.clamp(1.0 - alpha_bar_prev, min=0.0)) * eps
+        else:
+            # DDIM sigma formula (batched)
+            sigma_t = eta * torch.sqrt(
+                (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t) * (1.0 - alpha_bar_t / torch.clamp(alpha_bar_prev, min=1e-12))
+            )
+            # clamp the inside of sqrt
+            coef_eps = torch.sqrt(torch.clamp(1.0 - alpha_bar_prev - sigma_t**2, min=0.0))
+            x_prev = (torch.sqrt(alpha_bar_prev) * pred_clean +
+                      coef_eps * eps +
+                      sigma_t * torch.randn_like(noisy_x))
+
+        # Respect attention mask: keep padded positions equal to x_t (no change)
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).float()
+            x_prev = x_prev * mask + noisy_x * (1.0 - mask)
+
+        return x_prev
+
 
 class FiLM(nn.Module):
     def __init__(self, dim):
@@ -290,32 +346,62 @@ class DiffusionModel(nn.Module):
         self.ce_loss = ce_loss
         return loss, logits
 
-    def reverse_diffusion(self, input_ids, attention_mask, token_type_ids=None, 
-                         images=None, aux_imgs=None, rcnn_imgs=None, steps=None):
+    def reverse_diffusion(self, labels, input_ids, attention_mask, token_type_ids=None,
+                      images=None, aux_imgs=None, rcnn_imgs=None, steps=None, eta=None):
+        """
+        Reverse diffusion sampling using DDIM with schedule-aware t_prev.
+        - steps: number of sampling steps (e.g., 10, 50)
+        - eta: DDIM eta value; if None, read from args.ddim_eta
+        """
+        eta = 0.0 if eta is None else eta
         batch_size, seq_len = input_ids.shape
         steps = steps or getattr(self.args, 'reverse_steps', 50)
+
+        with torch.no_grad():
+            _, x0, _ = self.label_encoder(edge_index_dict=None, label_indices=labels)
+            t_T = torch.full((batch_size,), self.args.train_steps-1, device=self.args.device, dtype=torch.long)
+            xT, _ = self.noise_scheduler.add_noise(x0, t_T, attention_mask)
+
+        # initialize with noise but respect padding: pads should be 0 if you never corrupted them
         label_embeddings = torch.randn(batch_size, seq_len, self.args.embed_dim, device=self.args.device)
-        
-        step_size = self.args.train_steps // steps
-        timesteps = list(reversed(range(0, self.args.train_steps, step_size)))[:steps]
-        
-        for t in timesteps:
-            t_tensor = torch.full((batch_size,), t, device=self.args.device, dtype=torch.long)
-            pred_embeddings = self.denoise(
-                label_embeddings, t_tensor, input_ids, attention_mask, 
-                token_type_ids, images, aux_imgs, rcnn_imgs
-            )
-            eta = getattr(self.args, 'ddim_eta', 0.0)
-            label_embeddings = self.noise_scheduler.step(pred_embeddings, t_tensor, label_embeddings, eta=eta)
-        
-        pred_embeddings = self.denoise(
-            label_embeddings, torch.zeros(batch_size, device=self.args.device, dtype=torch.long),
-            input_ids, attention_mask, token_type_ids, images, aux_imgs, rcnn_imgs
-        )
-        
-        logits = self.decoder(pred_embeddings)
+        print("x_T mean/std:", xT.mean().item(), xT.std().item())
+        print("pureN mean/std:", label_embeddings.mean().item(), label_embeddings.std().item())
+        diff = (xT - label_embeddings).abs().mean().item()
+        print("mean abs diff between q(x_T) and N(0,I):", diff)
+
+        if attention_mask is not None:
+            label_embeddings = label_embeddings * attention_mask.unsqueeze(-1).float()
+
+        # Build sampling timesteps (monotonic descending). We choose evenly spaced indices from [0, train_steps)
+        train_T = self.args.train_steps
+        step_size = max(1, train_T // steps)
+        timesteps = list(reversed(range(0, train_T, step_size)))[:steps]
+        # ensure we always include 0 as final step
+        if timesteps[-1] != 0:
+            timesteps.append(0)
+
+        # iterate over schedule, pass explicit t_prev
+        for i, t in enumerate(timesteps):
+            t_current = torch.full((batch_size,), t, dtype=torch.long, device=self.args.device)
+            if i + 1 < len(timesteps):
+                t_prev_val = timesteps[i + 1]
+                t_prev_tensor = torch.full((batch_size,), t_prev_val, dtype=torch.long, device=self.args.device)
+            else:
+                t_prev_tensor = torch.full((batch_size,), -1, dtype=torch.long, device=self.args.device)   # indicates alpha_bar_prev = 1.0
+
+            with torch.no_grad():
+                pred_x0 = self.denoise(label_embeddings, t_current, input_ids, attention_mask,
+                                    token_type_ids, images, aux_imgs, rcnn_imgs)
+                label_embeddings = self.noise_scheduler.step(pred_x0, t_current, label_embeddings,
+                                                            t_prev=t_prev_tensor, eta=eta, attention_mask=attention_mask)
+
+        # After loop we are at x_0 (or close); denoise once at t=0 for stability if you want
+        with torch.no_grad():
+            pred_x0_final = self.denoise(label_embeddings, torch.zeros(batch_size, dtype=torch.long, device=self.args.device),
+                                        input_ids, attention_mask, token_type_ids, images, aux_imgs, rcnn_imgs)
+
+        logits = self.decoder(pred_x0_final)
         pred_labels = torch.argmax(logits, dim=-1)
         if getattr(self.args, 'post_process', True):
             pred_labels = post_process_bio_labels(pred_labels, self.num_labels)
-        logger.debug(f"Predicted labels: {pred_labels[0].tolist()}")
         return pred_labels

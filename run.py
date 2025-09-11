@@ -56,6 +56,10 @@ GNN_PATH = {
     'twitter15': 'gnn/twitter2015',
     'twitter17': 'gnn/twitter2017'
 }
+VT_PATH = {
+    'twitter15': 'vt_encoder/twitter2015',
+    'twitter17': 'vt_encoder/twitter2017'
+}
 
 def set_seed(seed):
     """Set random seed for reproducibility."""
@@ -65,7 +69,7 @@ def set_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-def validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, gnn_path, use_prompt):
+def validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, gnn_path, vt_path, ner_model_name, use_prompt):
     """Validate dataset, image, and model paths."""
     for key, path in data_path.items():
         if not os.path.exists(path):
@@ -76,6 +80,8 @@ def validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, gnn_path
                 raise FileNotFoundError(f"Image path {path} does not exist")
     if not os.path.exists(os.path.join(gnn_path, "gnn_hetero_best_decoder.pth")):
         raise FileNotFoundError(f"GNN weights not found at {gnn_path}/gnn_hetero_best_decoder.pth")
+    if not os.path.exists(os.path.join(vt_path, ner_model_name + ".pth")):
+        raise FileNotFoundError(f"Visual-Textual Encoder weights not found at {vt_path}/{ner_model_name}.pth")
 
 def main():
     """Main function for NER diffusion model pretraining or finetuning."""
@@ -104,10 +110,10 @@ def main():
     parser.add_argument('--notes', default="", type=str, help="Notes for save path directory.")
     parser.add_argument('--aux_size', default=128, type=int, help="Auxiliary image size.")
     parser.add_argument('--rcnn_size', default=128, type=int, help="RCNN image size.")
-    parser.add_argument('--train_steps', default=50, type=int, help="Diffusion training timesteps.")
+    parser.add_argument('--train_steps', default=500, type=int, help="Diffusion training timesteps.")
     parser.add_argument('--reverse_steps', default=10, type=int, help="Diffusion inference timesteps.")
     parser.add_argument('--patience', default=5, type=int, help="Early stopping patience.")
-    parser.add_argument('--noise_scale', default=0.5, type=float, help="Gaussian noise scale for diffusion.")
+    parser.add_argument('--noise_scale', default=1.0, type=float, help="Gaussian noise scale for diffusion.")
     parser.add_argument("--mode", default="pretrain", type=str, choices=["pretrain", "finetune"], help="Training mode.")
     parser.add_argument("--t_zero_prob", default=0.3, type=float, help="The probability of sampling t = 0 during training.")
     parser.add_argument("--ce_weight", default=0.5, type=float, help="The weight of cross entropy loss.")
@@ -138,10 +144,11 @@ def main():
     rcnn_imgs_path = RCNN_PATH[args.dataset_name] if args.use_prompt else None
     data_path = DATA_PATH[args.dataset_name]
     gnn_path = GNN_PATH[args.dataset_name]
+    vt_path = VT_PATH[args.dataset_name]
     logger.info("Using visual prompts: images enabled." if args.use_prompt else "No visual prompts: text-only encoding.")
 
     # Validate paths
-    validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, gnn_path, args.use_prompt)
+    validate_paths(data_path, imgs_path, aux_imgs_path, rcnn_imgs_path, gnn_path, vt_path, args.ner_model_name, args.use_prompt)
 
     # Define image transformations
     transform = transforms.Compose([
@@ -226,18 +233,23 @@ def main():
     # Visual-textual encoder
     if args.ner_model_name == "hvpnet":
         ner_model = HMNeTNERModel(num_labels, args)
+    elif args.ner_model_name == "mkgformer":
+        ner_model = UnimoCRFModel(num_labels, args)
+    else:
+        raise ValueError("Invalid ner_model_name")
+    ner_model = ner_model.to(args.device)
+    if vt_path:
+        logger.info(f"Loading Visual-textual Info Encoder weights from {os.path.join(vt_path, args.ner_model_name + '.pth')}")
+        ner_model.load_state_dict(torch.load(os.path.join(vt_path, args.ner_model_name + '.pth')))
+
+    if args.ner_model_name == "hvpnet":
         vt_encoder = ner_model.core
         vt_hidden_size = vt_encoder.bert.config.hidden_size
     elif args.ner_model_name == "mkgformer":
-        ner_model = UnimoCRFModel(num_labels, args)
         vt_encoder = ner_model.model
         vt_hidden_size = vt_encoder.text_config.hidden_size
     else:
         raise ValueError("Invalid ner_model_name")
-    vt_encoder = vt_encoder.to(args.device)
-    if getattr(args, 'ner_pretrained_path', None):
-        logger.info(f"Loading NER encoder weights from {args.ner_pretrained_path}")
-        vt_encoder.load_state_dict(torch.load(args.ner_pretrained_path))
 
     # Initialize diffusion model
     model = DiffusionModel(
