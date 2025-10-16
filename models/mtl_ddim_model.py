@@ -140,12 +140,13 @@ def post_process_bio_labels(bio_labels, num_bio_labels):
     return valid_labels
 
 class DiffusionModel(nn.Module):
-    def __init__(self, args, num_labels=0, label_encoder=None, vt_encoder=None, vt_hidden_size=0):
+    def __init__(self, args, num_labels=0, label_encoder=None, vt_encoder=None, label_embedding_normalizer=None, vt_hidden_size=0):
         super().__init__()
         self.args = args
         self.num_labels = num_labels
         self.label_encoder = label_encoder
         self.vt_encoder = vt_encoder
+        self.label_embedding_normalizer = label_embedding_normalizer
 
         # DDIM Scheduler
         self.noise_scheduler = DDIMScheduler(
@@ -250,6 +251,7 @@ class DiffusionModel(nn.Module):
             logger.warning(f"Label indices out of range: max={labels.max().item()}, num_labels={self.num_labels}")
         
         _, clean_embeddings, _ = self.label_encoder(edge_index_dict=None, label_indices=labels)
+        clean_embeddings = self.label_embedding_normalizer(clean_embeddings) # To guarantee the corrupted embedding approximate unit Gaussian noise
         corrupt_embeddings, _ = self.noise_scheduler.add_noise(clean_embeddings, t, attention_mask)
         return corrupt_embeddings, clean_embeddings
 
@@ -312,7 +314,8 @@ class DiffusionModel(nn.Module):
         cos_sim = F.cosine_similarity(valid_pred, valid_clean, dim=-1).mean()
 
         # Decoder performance on clean embeddings
-        clean_logits = self.decoder(clean_embeddings)
+        orig_clean_embeddings = self.label_embedding_normalizer.denormalize(clean_embeddings)
+        clean_logits = self.decoder(orig_clean_embeddings)
         valid_clean_logits = clean_logits.view(-1, self.num_labels)[valid_mask_1d]
         valid_labels = labels.view(-1)[valid_mask_1d]
         clean_ce_loss = F.cross_entropy(valid_clean_logits, valid_labels, reduction='sum') / valid_mask_1d.sum().clamp(min=1)
@@ -327,13 +330,16 @@ class DiffusionModel(nn.Module):
             clean_embeddings * valid_mask_3d,
             reduction='sum'
         ) / valid_mask_3d.sum().clamp(min=1)
-        ce_loss = F.cross_entropy(valid_logits, valid_labels, reduction='sum') / valid_mask_1d.sum().clamp(min=1)
+        # ce_loss = F.cross_entropy(valid_logits, valid_labels, reduction='sum') / valid_mask_1d.sum().clamp(min=1)
 
-        # Combine losses
-        k = getattr(self.args, 'ce_decay_k', 5.0)
-        ce_weight = self.args.ce_weight * torch.exp(-k * (self.t_random / self.args.train_steps)).mean()
-        # loss = mse_loss + ce_weight * ce_loss
-        loss = mse_loss + ce_loss
+        # # Combine losses
+        # k = getattr(self.args, 'ce_decay_k', 5.0)
+        # ce_weight = self.args.ce_weight * torch.exp(-k * (self.t_random / self.args.train_steps)).mean()
+        # # loss = mse_loss + ce_weight * ce_loss
+        # loss = mse_loss + ce_loss
+        loss = mse_loss
+        ce_loss = 0
+        ce_weight = 0
 
         # Logging
         if torch.isnan(loss) or torch.isinf(loss):
@@ -343,10 +349,11 @@ class DiffusionModel(nn.Module):
                     f"mse_loss = {mse_loss:.4f}, ce_loss = {ce_loss:.4f}, ce_weight = {ce_weight:.4f}")
 
         self.mse_loss = mse_loss
-        self.ce_loss = ce_loss
+        # self.ce_loss = ce_loss
+        self.ce_loss = 0
         return loss, logits
 
-    def reverse_diffusion(self, labels, input_ids, attention_mask, token_type_ids=None,
+    def reverse_diffusion(self, initial_noise, input_ids, attention_mask, token_type_ids=None,
                       images=None, aux_imgs=None, rcnn_imgs=None, steps=None, eta=None):
         """
         Reverse diffusion sampling using DDIM with schedule-aware t_prev.
@@ -357,18 +364,7 @@ class DiffusionModel(nn.Module):
         batch_size, seq_len = input_ids.shape
         steps = steps or getattr(self.args, 'reverse_steps', 50)
 
-        with torch.no_grad():
-            _, x0, _ = self.label_encoder(edge_index_dict=None, label_indices=labels)
-            t_T = torch.full((batch_size,), self.args.train_steps-1, device=self.args.device, dtype=torch.long)
-            xT, _ = self.noise_scheduler.add_noise(x0, t_T, attention_mask)
-
-        # initialize with noise but respect padding: pads should be 0 if you never corrupted them
-        label_embeddings = torch.randn(batch_size, seq_len, self.args.embed_dim, device=self.args.device)
-        print("x_T mean/std:", xT.mean().item(), xT.std().item())
-        print("pureN mean/std:", label_embeddings.mean().item(), label_embeddings.std().item())
-        diff = (xT - label_embeddings).abs().mean().item()
-        print("mean abs diff between q(x_T) and N(0,I):", diff)
-
+        label_embeddings = initial_noise
         if attention_mask is not None:
             label_embeddings = label_embeddings * attention_mask.unsqueeze(-1).float()
 
@@ -400,8 +396,20 @@ class DiffusionModel(nn.Module):
             pred_x0_final = self.denoise(label_embeddings, torch.zeros(batch_size, dtype=torch.long, device=self.args.device),
                                         input_ids, attention_mask, token_type_ids, images, aux_imgs, rcnn_imgs)
 
-        logits = self.decoder(pred_x0_final)
-        pred_labels = torch.argmax(logits, dim=-1)
-        if getattr(self.args, 'post_process', True):
-            pred_labels = post_process_bio_labels(pred_labels, self.num_labels)
-        return pred_labels
+        # orig_pred_x0_final = self.label_embedding_normalizer.denormalize(pred_x0_final)
+        # logits = self.decoder(orig_pred_x0_final)
+        # pred_labels = torch.argmax(logits, dim=-1)
+        # if getattr(self.args, 'post_process', True):
+        #     pred_labels = post_process_bio_labels(pred_labels, self.num_labels)
+        # return pred_labels
+        return pred_x0_final
+    
+    def generate(self, input_ids, attention_mask, token_type_ids=None, images=None, aux_imgs=None, rcnn_imgs=None, initial_noise=None):
+        bsz = input_ids.shape[0]
+        if initial_noise is None:
+            initial_noise = torch.randn(bsz, self.args.max_seq_len, self.args.embed_dim, device=self.args.device)
+        generated_label_embedding = self.reverse_diffusion(initial_noise, input_ids, attention_mask, token_type_ids, images, aux_imgs, rcnn_imgs, self.args.eta)
+        generated_label_embedding = self.label_embedding_normalizer.denormalize(generated_label_embedding)
+        generated_label_logits = self.decoder(generated_label_embedding)
+        generated_labels = torch.argmax(generated_label_logits, dim=-1)
+        return generated_labels

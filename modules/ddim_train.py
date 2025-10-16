@@ -42,33 +42,16 @@ class PreTrainer(BaseTrainer):
         self.scheduler = None
         self.best_model_path = os.path.join(args.save_path, f"{args.dataset_name}_{args.ner_model_name}_ner_{args.mode}_best.pth")
         self.final_model_path = os.path.join(args.save_path, f"{args.dataset_name}_{args.ner_model_name}_ner_{args.mode}_final.pth")
-        if self.metrics_file:
-            with open(self.metrics_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['epoch', 'stage', 'batch', 'ner_f1', 'mse_loss', 'ce_loss'])
+        # if self.metrics_file:
+        #     with open(self.metrics_file, 'a', newline='') as f:
+        #         writer = csv.writer(f)
+        #         writer.writerow(['epoch', 'stage', 'batch', 'ner_f1', 'mse_loss', 'ce_loss'])
 
     def training_settings_init(self):
         for name, param in self.model.named_parameters():
             print(name, param.shape, param.requires_grad)
         """Configure optimizer and scheduler for NER pre-training."""
         parameters = []
-        # Text parameters in the vt encoder
-        params = {'lr': 3e-5, 'weight_decay': 1e-2, 'params': []}
-        for name, param in self.model.named_parameters():
-            if 'vt_encoder.bert' in name.lower() or 'vt_encoder.text' in name.lower():
-                params['params'].append(param)
-        if params['params']:
-            parameters.append(params)
-
-        # Vision parameters in the vt encoder
-        params = {'lr': 3e-5, 'weight_decay': 1e-2, 'params': []}
-        for name, param in self.model.named_parameters():
-            if ('vt_encoder.vision' in name.lower() or 'vt_encoder.encoder_conv' in name.lower() or 
-                'vt_encoder.gates' in name.lower()):
-                params['params'].append(param)
-        if params['params']:
-            parameters.append(params)
-
         # Attention layers
         params = {'lr': 1e-3, 'weight_decay': 1e-2, 'params': []}
         for name, param in self.model.named_parameters():
@@ -96,25 +79,14 @@ class PreTrainer(BaseTrainer):
         # MLP, projection, and embedding layers
         params = {'lr': 1e-3, 'weight_decay': 1e-2, 'params': []}
         for name, param in self.model.named_parameters():
-            if ('time_embed' in name.lower() or 'vt_proj' in name.lower() or 
+            if ('rate_embed' in name.lower() or 'vt_proj' in name.lower() or 
                 'label_proj' in name.lower() or 'embedding_pred' in name.lower() or 
                 'classifier' in name.lower()):
                 params['params'].append(param)
         if params['params']:
             parameters.append(params)
 
-        # LabelEncoder parameters
-        params = {'lr': 1e-4, 'weight_decay': 5e-3, 'params': []}
-        for name, param in self.model.named_parameters():
-            if name.lower().startswith('label_encoder.') and 'label_proj' not in name.lower():
-                params['params'].append(param)
-        if params['params']:
-            parameters.append(params)
-
-        # Freeze image_model for hvpnet
-        # for name, param in self.model.named_parameters():
-        #     if self.args.ner_model_name == 'hvpnet' and 'vt_encoder.image_model' in name.lower():
-        #         param.requires_grad = False
+        # Freeze the vt encoder and label encoder
         for name, param in self.model.named_parameters():
             if name.lower().startswith('vt_encoder'):
                 param.requires_grad = False
@@ -162,15 +134,12 @@ class PreTrainer(BaseTrainer):
 
         self.step = 0
         self.no_improve = 0
-        t_threshold = 0.1 * self.args.train_steps
         with tqdm(total=self.train_num_steps, postfix="loss:{0:<6.5f}", leave=False, dynamic_ncols=True) as pbar:
             avg_loss = 0
             loss_count = 0
             for epoch in range(self.args.num_epochs):
                 pbar.set_description_str(f"Epoch {epoch + 1}/{self.args.num_epochs}")
                 epoch_loss = 0.0
-                epoch_mse_loss = 0.0
-                epoch_ce_loss = 0.0
                 batch_count = 0
                 all_true_labels, all_pred_labels = [], []
                 self._batch_idx = 0
@@ -180,11 +149,11 @@ class PreTrainer(BaseTrainer):
                     self.step += 1
                     self._batch_idx += 1
                     batch = [tup.to(self.args.device) if isinstance(tup, torch.Tensor) else tup for tup in batch]
-                    loss, true_labels, pred_labels, attention_mask, t_random = self._step(
+                    loss, true_labels, pred_labels, attention_mask = self._step(
                         batch, task, stage, epoch
                     )
                     if loss is not None:
-                        loss = loss / self.args.grad_accum_steps
+                        # loss = loss / self.args.grad_accum_steps
                         # loss.backward()
                         # if self.step % self.args.grad_accum_steps == 0:
                         #     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -200,23 +169,19 @@ class PreTrainer(BaseTrainer):
                         self.optimizer.zero_grad()
                         batch_loss = loss.detach().cpu().item()
 
-                        batch_mse_loss = self.model.mse_loss.item() if self.model.mse_loss is not None else 0.0
-                        batch_ce_loss = self.model.ce_loss.item() if self.model.ce_loss is not None else 0.0
                         epoch_loss += batch_loss
-                        epoch_mse_loss += batch_mse_loss
-                        epoch_ce_loss += batch_ce_loss
                         batch_count += 1
                         avg_loss += batch_loss
                         loss_count += 1
-                        if pred_labels is not None and t_random is not None and (t_random < t_threshold).any():
-                            valid_mask = (t_random < t_threshold).view(-1, 1) & attention_mask.bool()
-                            true_labels_batch, pred_labels_batch = self._gen_labels(
-                                pred_labels[valid_mask[:, 0]], 
-                                true_labels[valid_mask[:, 0]], 
-                                attention_mask[valid_mask[:, 0]]
-                            )
-                            all_true_labels.extend(true_labels_batch)
-                            all_pred_labels.extend(pred_labels_batch)
+
+                        valid_mask = attention_mask.bool()
+                        true_labels_batch, pred_labels_batch = self._gen_labels(
+                            pred_labels[valid_mask[:, 0]], 
+                            true_labels[valid_mask[:, 0]], 
+                            attention_mask[valid_mask[:, 0]]
+                        )
+                        all_true_labels.extend(true_labels_batch)
+                        all_pred_labels.extend(pred_labels_batch)
 
                     if self.step % self.refresh_step == 0:
                         avg_loss_display = avg_loss / loss_count if loss_count > 0 else 0.0
@@ -232,7 +197,7 @@ class PreTrainer(BaseTrainer):
                         micro_f1 = results_dict.get('micro avg', {}).get('f1-score', 0.0)
                         self.logger.info(f"***** Epoch {epoch + 1} Train Eval Results *****")
                         self.logger.info("\n%s", results_str)
-                    self.logger.info(f"Epoch {epoch + 1}/{self.args.num_epochs}, Loss: {epoch_loss/batch_count:.4f}, MSE Loss: {epoch_mse_loss/batch_count:.4f}, CE Loss: {epoch_ce_loss/batch_count:.4f}, NER Micro F1: {micro_f1:.4f}")
+                    self.logger.info(f"Epoch {epoch + 1}/{self.args.num_epochs}, Loss: {epoch_loss/batch_count:.4f}, NER Micro F1: {micro_f1:.4f}")
 
                     if self.metrics_file:
                         with open(self.metrics_file, 'a', newline='') as f:
@@ -242,8 +207,7 @@ class PreTrainer(BaseTrainer):
                                 "train",
                                 batch_count,
                                 micro_f1,
-                                epoch_mse_loss/batch_count if batch_count > 0 else 0.0,
-                                epoch_ce_loss/batch_count if batch_count > 0 else 0.0
+                                epoch_loss/batch_count if batch_count > 0 else 0.0
                             ])
 
                 if epoch >= self.args.eval_begin_epoch:
@@ -351,21 +315,17 @@ class PreTrainer(BaseTrainer):
                 rcnn_imgs=rcnn_imgs
             )
             pred_labels = torch.argmax(logits, dim=-1) if logits is not None else None
-            t_random = getattr(self.model, 't_random', None)
-            return loss, labels, pred_labels, attention_mask, t_random
         else:
-            pred_labels = self.model.reverse_diffusion(
-                labels=labels,
+            pred_labels = self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
                 images=images,
                 aux_imgs=aux_imgs,
-                rcnn_imgs=rcnn_imgs,
-                steps=getattr(self.args, 'reverse_steps', 100)
+                rcnn_imgs=rcnn_imgs
             )
             loss = None
-            return loss, labels, pred_labels, attention_mask, None
+        return loss, labels, pred_labels, attention_mask
 
     def _eval_labels(self, pbar, data, epoch, task="ner_pretrain", stage="val"):
         """Evaluate NER labels for validation or test set."""
@@ -376,10 +336,9 @@ class PreTrainer(BaseTrainer):
 
         for batch in data:
             batch = [tup.to(self.args.device) if isinstance(tup, torch.Tensor) else tup for tup in batch]
-            loss, true_labels, pred_labels, attention_mask, _ = self._step(
+            _, true_labels, pred_labels, attention_mask = self._step(
                 batch, task, stage, epoch
             )
-            self.logger.info(f"Batch {self._batch_idx}: pred_labels shape={pred_labels.shape}, true_labels shape={true_labels.shape}")
 
             if pred_labels is not None:
                 true_labels_batch, pred_labels_batch = self._gen_labels(pred_labels, true_labels, attention_mask)

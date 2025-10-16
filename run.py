@@ -12,10 +12,12 @@ import random
 import csv
 from processor.dataset import LEDProcessor, LEDDataset
 from models.mtl_ddim_model import DiffusionModel
+# from models.ddim_model import DiffusionModel
 from modules.ddim_train import PreTrainer
 from models.gnn_model import HeteroLabelEmbeddingGNN
 from models.bert_model import HMNeTNERModel
 from models.unimo_model import UnimoCRFModel
+from utils.utils import LabelEmbeddingNormalizer
 
 # Configure logging
 logging.basicConfig(
@@ -110,8 +112,9 @@ def main():
     parser.add_argument('--notes', default="", type=str, help="Notes for save path directory.")
     parser.add_argument('--aux_size', default=128, type=int, help="Auxiliary image size.")
     parser.add_argument('--rcnn_size', default=128, type=int, help="RCNN image size.")
-    parser.add_argument('--train_steps', default=500, type=int, help="Diffusion training timesteps.")
-    parser.add_argument('--reverse_steps', default=10, type=int, help="Diffusion inference timesteps.")
+    parser.add_argument('--train_steps', default=50, type=int, help="Diffusion training timesteps.")
+    parser.add_argument('--reverse_steps', default=20, type=int, help="Diffusion inference timesteps.")
+    parser.add_argument('--eta', default=0.0, type=float, help="eta in ddim.")
     parser.add_argument('--patience', default=5, type=int, help="Early stopping patience.")
     parser.add_argument('--noise_scale', default=1.0, type=float, help="Gaussian noise scale for diffusion.")
     parser.add_argument("--mode", default="pretrain", type=str, choices=["pretrain", "finetune"], help="Training mode.")
@@ -217,7 +220,7 @@ def main():
     metrics_file = os.path.join(logdir, "metrics.csv")
     with open(metrics_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'stage', 'batch', 'ner_f1', 'mse_loss', 'ce_loss'])
+        writer.writerow(['epoch', 'stage', 'batch', 'ner_f1', 'loss'])
     logger.info(f"Logging metrics to {metrics_file}")
 
     # Label encoder (pre-trained GNN, fine-tuned)
@@ -229,6 +232,14 @@ def main():
     if gnn_path:
         logger.info(f"Loading GNN weights from {os.path.join(gnn_path, 'gnn_hetero_best_decoder.pth')}")
         label_encoder.load_state_dict(torch.load(os.path.join(gnn_path, "gnn_hetero_best_decoder.pth")))
+
+    # Compute the mean and std of the label embeddings for the whole dataset #
+    logger.info(f"Computing the mean and std of label embeddings")
+    dataloader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True
+    )
+    label_embedding_normalizer = LabelEmbeddingNormalizer(num_labels=num_labels, label_encoder=label_encoder)
+    label_embedding_normalizer.adapt(dataloader)
 
     # Visual-textual encoder
     if args.ner_model_name == "hvpnet":
@@ -257,6 +268,7 @@ def main():
         num_labels=num_labels,
         label_encoder=label_encoder,
         vt_encoder=vt_encoder,
+        label_embedding_normalizer=label_embedding_normalizer,
         vt_hidden_size=vt_hidden_size
     ).to(args.device)
 

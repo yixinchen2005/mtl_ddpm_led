@@ -2,13 +2,11 @@ import torch
 import numpy as np
 import random
 from torch import nn
-from collections import OrderedDict
-from torch.utils.data import Subset
 import albumentations as A
 from PIL import Image
-from datetime import datetime
-import torch.nn.functional as F
 import logging
+from tqdm import tqdm
+from collections import Counter
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -166,3 +164,262 @@ def test_embedding_robustness(embeddings, labels, semantic_similarities, num_sam
             logger.warning(f"Separation failure: Min distance {min_distance:.4f} < 1.0")
 
     return results
+        
+# class LabelEmbeddingNormalizer(nn.Module):
+#     def __init__(self, label_encoder, num_labels=13, eps=1e-6, device="cpu"):
+#         """
+#         Args:
+#             label_encoder: function or module that maps label_indices -> embeddings
+#             num_labels: total number of labels in the label table
+#             eps: small constant for numerical stability
+#             device: device to store buffers
+#         """
+#         super().__init__()
+#         self.label_encoder = label_encoder
+#         self.num_labels = num_labels
+#         self.eps = eps
+#         self.device = device
+
+#         # will be filled by adapt()
+#         self.register_buffer("mean", None)
+#         self.register_buffer("std", None)
+
+#     @torch.no_grad()
+#     def adapt(self, dataloader=None, mode="dataset"):
+#         """
+#         Compute mean/std from label embeddings.
+
+#         Args:
+#             dataloader: required if mode="dataset" (for label frequencies)
+#             mode: "table" (all labels equal) or "dataset" (weighted by label frequencies)
+#         """
+#         # --- Step 1: precompute embeddings for all labels ---
+#         label_indices = torch.arange(self.num_labels, device=self.device).unsqueeze(0)
+#         _, label_embs, _ = self.label_encoder(edge_index_dict=None, label_indices=label_indices)
+#         label_embs = label_embs.squeeze(0).to(self.device)
+#         # shape: (num_labels, dim)
+
+#         if mode == "table":
+#             # Equal weight across labels
+#             mean = label_embs.mean(dim=0)
+#             std = label_embs.std(dim=0, unbiased=False)
+
+#         elif mode == "dataset":
+#             if dataloader is None:
+#                 raise ValueError("dataloader must be provided for mode='dataset'")
+
+#             # Count frequencies
+#             label_counter = Counter()
+#             with tqdm(total=len(dataloader), leave=False, dynamic_ncols=True, desc="Counting Labels") as pbar:
+#                 for batch in dataloader:
+#                     labels, *_ = batch  # assume labels shape: (bsz, seq_len)
+#                     labels = labels.view(-1).tolist()
+#                     label_counter.update(labels)
+#                     pbar.update()
+
+#                 freqs = torch.tensor([label_counter[i] for i in range(self.num_labels)],
+#                                     dtype=torch.float32, device=self.device)
+#                 freqs = freqs / freqs.sum()  # normalize to probabilities
+#                 pbar.close()
+
+#             # Weighted stats
+#             mean = (freqs.unsqueeze(1) * label_embs).sum(dim=0)
+#             diffs = label_embs - mean
+#             var = (freqs.unsqueeze(1) * (diffs ** 2)).sum(dim=0)
+#             std = torch.sqrt(var + self.eps)
+#             print(mean)
+#             print(std)
+
+#         else:
+#             raise ValueError("mode must be 'table' or 'dataset'")
+
+#         # Save buffers
+#         self.mean = mean
+#         self.std = std
+
+#     def forward(self, label_embs):
+#         """Normalize embeddings (bsz, seq_len, dim)."""
+#         if self.mean is None or self.std is None:
+#             raise RuntimeError("You must call .adapt(...) before using forward()")
+#         return (label_embs - self.mean) / (self.std + self.eps)
+
+#     def denormalize(self, norm_embs):
+#         """Inverse of forward()."""
+#         if self.mean is None or self.std is None:
+#             raise RuntimeError("You must call .adapt(...) before using denormalize()")
+#         return norm_embs * (self.std + self.eps) + self.mean
+
+# class LabelEmbeddingNormalizer(nn.Module):
+#     def __init__(self, label_encoder=None, eps=1e-6, device="cpu"):
+#         super().__init__()
+#         self.label_encoder = label_encoder
+#         self.eps = eps
+#         self.device = device
+
+#         # Final stats
+#         self.register_buffer("mean", None)
+#         self.register_buffer("std", None)
+
+#     def adapt(self, data_loader):
+#         """
+#         Incrementally update mean and std using data_loader.
+#         Can be called multiple times on train/val/test loaders.
+#         """
+#         sum_ = torch.zeros(128, device=self.device)
+#         sumsq = torch.zeros(128, device=self.device)
+#         n_embs = 0
+
+#         with tqdm(total=len(data_loader), leave=False, dynamic_ncols=True, desc="Computing") as pbar:
+#             for batch in data_loader:
+#                 batch = [t.to(self.device) if isinstance(t, torch.Tensor) else t for t in batch]
+#                 labels, *_ = batch
+#                 _, label_embs, _ = self.label_encoder(edge_index_dict=None, label_indices=labels)
+#                 label_embs = label_embs.reshape(-1, label_embs.shape[-1]).to(self.device)  # (N, dim)
+#                 # Update accumulators
+#                 sum_ += label_embs.sum(dim=0)
+#                 sumsq += (label_embs ** 2).sum(dim=0)
+#                 n_embs += label_embs.shape[0]
+#                 pbar.update()
+
+#             # Update stats after this call
+#             mean = sum_ / n_embs
+#             var = (sumsq / n_embs) - mean.pow(2)
+#             std = torch.sqrt(var + self.eps)
+#             pbar.close()
+#         print(mean)
+#         print(std)
+
+#         self.mean = mean
+#         self.std = std
+
+#     def forward(self, label_embs):
+#         if self.mean is None or self.std is None:
+#             raise RuntimeError("You must call .adapt(dataset) before using forward().")
+#         return (label_embs - self.mean) / (self.std + self.eps)
+
+#     def denormalize(self, label_embs):
+#         if self.mean is None or self.std is None:
+#             raise RuntimeError("You must call .adapt(dataset) before using denormalize().")
+#         return label_embs * (self.std + self.eps) + self.mean
+
+class LabelEmbeddingNormalizer(nn.Module):
+    def __init__(self, num_labels, label_encoder=None, eps=1e-6, device="cpu"):
+        super().__init__()
+        self.num_labels = num_labels
+        self.label_encoder = label_encoder
+        self.eps = eps
+        self.device = device
+
+        # Buffers for per-label mean/std
+        self.register_buffer("mean", None)
+        self.register_buffer("std", None)
+
+        # Also keep global mean/std for fallback use
+        self.register_buffer("global_mean", None)
+        self.register_buffer("global_std", None)
+
+    def adapt(self, data_loader):
+        """
+        Compute per-label mean/std and global mean/std from embeddings.
+        """
+        sum_, sumsq, counts = None, None, None
+
+        with tqdm(total=len(data_loader), leave=False, dynamic_ncols=True, desc="Computing") as pbar:
+            for batch in data_loader:
+                batch = [t.to(self.device) if isinstance(t, torch.Tensor) else t for t in batch]
+                labels, *_ = batch  # (B, L)
+
+                # Forward pass through label encoder
+                _, label_embs, _ = self.label_encoder(edge_index_dict=None, label_indices=labels)
+                B, L, D = label_embs.shape
+                label_embs = label_embs.reshape(-1, D).to(self.device)  # (N, D)
+                labels = labels.reshape(-1)  # (N,)
+
+                if sum_ is None:
+                    sum_ = torch.zeros(self.num_labels, D, device=self.device)
+                    sumsq = torch.zeros(self.num_labels, D, device=self.device)
+                    counts = torch.zeros(self.num_labels, device=self.device)
+
+                # Accumulate stats per label
+                for lbl in labels.unique():
+                    mask = (labels == lbl)
+                    if mask.any():
+                        embs_lbl = label_embs[mask]
+                        sum_[lbl] += embs_lbl.sum(dim=0)
+                        sumsq[lbl] += (embs_lbl ** 2).sum(dim=0)
+                        counts[lbl] += mask.sum().item()
+                pbar.update()
+        pbar.close()
+
+        # Finalize per-label stats
+        mean = torch.zeros_like(sum_)
+        std = torch.ones_like(sum_)
+        for lbl in range(self.num_labels):
+            if counts[lbl] > 0:
+                mean[lbl] = sum_[lbl] / counts[lbl]
+                var = (sumsq[lbl] / counts[lbl]) - mean[lbl].pow(2)
+                std[lbl] = torch.sqrt(var + self.eps)
+
+        # Global stats (just average across labels, weighted by counts)
+        total_count = counts.sum()
+        global_mean = (sum_.sum(dim=0) / total_count)
+        global_var = (sumsq.sum(dim=0) / total_count) - global_mean.pow(2)
+        global_std = torch.sqrt(global_var + self.eps)
+
+        # Store as detached buffers
+        self.register_buffer("mean", mean.detach())
+        self.register_buffer("std", std.detach())
+        self.register_buffer("global_mean", global_mean.detach())
+        self.register_buffer("global_std", global_std.detach())
+
+        print("Per-label mean/std shape:", mean.shape)
+        print("Global mean/std shape:", global_mean.shape)
+
+    def forward(self, label_embs, labels=None, probs=None):
+        """
+        Normalize embeddings.
+        Args:
+            label_embs: (B, L, D)
+            labels: (B, L) or None (if labels not available)
+            probs: (B, L, num_labels) or None (soft label predictions)
+        """
+        if self.mean is None or self.std is None:
+            raise RuntimeError("You must call .adapt(dataset) before using forward().")
+
+        if labels is not None:
+            # Supervised: use per-label stats
+            mean = self.mean[labels]  # (B, L, D)
+            std = self.std[labels]    # (B, L, D)
+        elif probs is not None:
+            # Soft label predictions: weighted combination
+            mean = torch.einsum("blc,cd->bld", probs, self.mean)  # (B, L, D)
+            std = torch.einsum("blc,cd->bld", probs, self.std)    # (B, L, D)
+        else:
+            # Fallback: global stats
+            mean = self.global_mean.view(1, 1, -1)
+            std = self.global_std.view(1, 1, -1)
+
+        return (label_embs - mean) / (std + self.eps)
+
+    def denormalize(self, label_embs, labels=None, probs=None):
+        """
+        Revert normalization.
+        Args:
+            label_embs: (B, L, D)
+            labels: (B, L) or None
+            probs: (B, L, num_labels) or None
+        """
+        if self.mean is None or self.std is None:
+            raise RuntimeError("You must call .adapt(dataset) before using denormalize().")
+
+        if labels is not None:
+            mean = self.mean[labels]
+            std = self.std[labels]
+        elif probs is not None:
+            mean = torch.einsum("blc,cd->bld", probs, self.mean)
+            std = torch.einsum("blc,cd->bld", probs, self.std)
+        else:
+            mean = self.global_mean.view(1, 1, -1)
+            std = self.global_std.view(1, 1, -1)
+
+        return label_embs * (std + self.eps) + mean
